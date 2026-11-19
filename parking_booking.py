@@ -1542,6 +1542,7 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
     receipt = {"outcome": "confirmed", "timezone": MADRID, **asdict(selection)}
     if references:
         reference, = references
+        selected_location = f"Building: {selection.building}\nFloor: {selection.floor}"
         for other in records:
             if other == record:
                 continue
@@ -1560,7 +1561,12 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
             )
             if not conflicting:
                 continue
-            if not other_references and day in other_days and other_spaces.keys() & space_names:
+            if not other_references and other_spaces.keys() & space_names:
+                # For a different date, fill in missing location fields to screen out unrelated rows.
+                if day not in other_days and (
+                    not other_days or not shows_location(f"{other}\n{selected_location}", *location)
+                ):
+                    continue
                 unresolved = "The linked reference for a conflicting Bookings row could not be verified."
                 if base_url is None:
                     return outcome("unknown", unresolved, RECONCILE)

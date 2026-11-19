@@ -978,6 +978,31 @@ class ParkingCommandTests(unittest.TestCase):
         self.assertEqual(result["confirmation_reference"], "OFFLINE-C17")
         self.assertEqual(self.form.clicks, 1)
 
+    def test_superficie_cli_checks_linked_reference_on_sparse_card_with_changed_date(self):
+        args = self.superficie_args() + ("--confirm",)
+        card = "November 21, 2026\nPSC-17\n07:00–23:00\nNEWTON, Parking Superficie C"
+        other = "November 22, 2026\nPSC-17"
+        different_space = "November 23, 2026\nPSC-18"
+        different_floor = "November 24, 2026\nPSC-17\nFloor: Parking Torres Quevedo"
+        reference = "\nReference: OFFLINE-C17"
+        self.form.after_submit = [card, different_space, different_floor, other]
+        self.form.linked = {card: card + reference, other: other + reference}
+
+        for run in ("initial", "retry"):
+            with self.subTest(run=run):
+                result = self.run_command(*args)
+                self.assertEqual(result["outcome"], "unknown")
+                self.assertIn("same reference", result["reason"])
+        self.assertEqual(self.form.detail_reads, [card, other, card, other])
+        self.assertEqual(self.form.clicks, 1)
+
+        self.form.linked[other] = other + "\nReference: OFFLINE-C18"
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertEqual(result["confirmation_reference"], "OFFLINE-C17")
+        self.assertEqual(self.form.detail_reads[-2:], [card, other])
+        self.assertEqual(self.form.clicks, 1)
+
     def test_superficie_cli_requires_consistent_location_on_card_and_linked_details(self):
         args = self.superficie_args() + ("--confirm",)
         card = ("November 21, 2026\nPSC-17\nBuilding: NEWTON\nFloor: Parking Superficie C\n"
