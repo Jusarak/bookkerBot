@@ -439,7 +439,9 @@ def card_locations(text):
             if icon:
                 location = location[icon.end():]
             parts = [part.strip() for part in location.split(",")]
-            if len(parts) in (2, 3) and all(parts[:2]):
+            if PARENTHESIZED_LOCATION.fullmatch(location.rstrip(",").rstrip()):
+                locations.append(location)
+            elif len(parts) in (2, 3) and all(parts[:2]):
                 locations.append(", ".join(parts[:2]))
             elif icon:
                 locations.append(location)

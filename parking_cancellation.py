@@ -55,6 +55,7 @@ def booking_location(text):
 def find_reservation(records, target, form, base_url, day):
     matches = []
     location = (target.building, target.floor) if target.building else None
+    requested_space = normalized(target.space) if target.space else None
     for record in records:
         days = dates(record, form.day_first)
         if day and days and day not in days:
@@ -62,9 +63,10 @@ def find_reservation(records, target, form, base_url, day):
         refs = booking_references(record)
         if target.reference and refs and target.reference not in refs:
             continue
-        if target.space:
+        if requested_space:
             labelled_spaces = {normalized(value) for value in field_values(record, SPACE_FIELD)}
-            if labelled_spaces and normalized(target.space) not in labelled_spaces:
+            if (labelled_spaces and requested_space not in labelled_spaces
+                    and requested_space not in displayed_spaces(record, form.day_first, location)):
                 continue
             if not shows_location(record, *location):
                 shown = booking_location(record)
