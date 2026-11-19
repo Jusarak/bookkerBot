@@ -91,14 +91,15 @@ NO_BOOKINGS = re.compile(
     r"(?: selected)?)?"
     r"(?: yet)?[.!]?$", re.I,
 )
+TEST_BOOKING_ROWS = "[data-testid=booking], [data-testid=booking-row], [data-testid=booking-card]"
 BOOKING_ROWS = (
-    "tbody tr, [role=row]:not(:has([role=columnheader])), "
-    "[data-testid=booking], [data-testid=booking-row], [data-testid=booking-card]"
+    f"tbody tr, [role=row]:not(:has([role=columnheader])), {TEST_BOOKING_ROWS}"
 )
 BOOKING_ARTICLE = "article.list-container"
 BOOKING_LIST_ROWS = (
     f"{BOOKING_ROWS}, mat-list-item, [role=listitem], "
-    f":is(app-booking, app-reservation):not(:has({BOOKING_ROWS}, mat-list-item, mat-card, [role=listitem]))"
+    f":is(app-booking, app-reservation):not(:has(tbody tr, [role=row], {TEST_BOOKING_ROWS}, "
+    "mat-list-item, mat-card, [role=listitem]))"
 )
 BOOKING_LOADING = "[aria-busy=true], [role=progressbar], mat-spinner, mat-progress-spinner"
 CONFIRMED_STATUS = re.compile(r"confirmed|booked|reserved|approved|confirmad[ao]|reservad[ao]|aprobad[ao]", re.I)
@@ -376,6 +377,19 @@ def shows(text, labels, value):
     return any(normalized(part) == normalized(value) for part in fields(text))
 
 
+def card_location(text):
+    # Bookker renders adjacent schedule and location spans on a single line.
+    for line in text.splitlines():
+        schedule = re.match(r"^\s*schedule\s*", line, re.I)
+        hours = INTERVAL.match(line, schedule.end()) if schedule else None
+        if hours:
+            location = re.sub(r"^\s*(?:location_on\s*)?", "", line[hours.end():], flags=re.I)
+            parts = [part.strip() for part in location.split(",")]
+            if len(parts) in (2, 3) and all(parts[:2]):
+                return parts[0], parts[1]
+    return None
+
+
 def shows_location(text, building, floor):
     building_labels, floor_labels = r"Building|Edificio", r"Floor|Planta"
     building_name, floor_name = normalized(building), normalized(floor)
@@ -400,7 +414,8 @@ def shows_location(text, building, floor):
         return all(pair.fullmatch(line) for line in labelled)
     return (bool(combined)
             or (shows(text, building_labels, building) and shows(text, floor_labels, floor))
-            or any(pair.fullmatch(line) for line in lines))
+            or any(pair.fullmatch(line) for line in lines)
+            or tuple(map(normalized, card_location(text) or ())) == (building_name, floor_name))
 
 
 def booking_space(text):
@@ -1141,6 +1156,8 @@ class ParkingForm:
                     and not visible(view.locator(BOOKING_ROWS).and_(content).and_(
                         view.locator(f":not({BOOKING_ARTICLE} *)")
                     )).count()):
+                if needs_history and UPCOMING_PERIOD.search(empty_marker.inner_text()):
+                    raise BookingProblem(BOOKINGS_PERIOD_REASON, CHECK_BOOKINGS_PERIOD)
                 return []
         articles = visible(view.locator(f"{BOOKING_ARTICLE}:not({navigation} *)"))
         article_count = articles.count()
@@ -1289,6 +1306,12 @@ class ParkingForm:
         if space:
             action = action.or_(row.get_by_role("link", name=space, exact=True))
         action = visible(action)
+        if not action.count():
+            # In the Material card the link wraps the title plus other card text.
+            titles = visible(row.locator('a .strong, [role=link] .strong'))
+            if space:
+                titles = titles.and_(row.get_by_text(space, exact=True))
+            action = titles
         if action.count() != 1 or not action.is_enabled(timeout=1000):
             raise BookingProblem("The matching Bookings row did not expose one booking details link.")
         if row.inner_text(timeout=1000).strip() != record:
@@ -1306,8 +1329,14 @@ class ParkingForm:
         ))
         if dialogs.count() == 1:
             return dialogs.inner_text(timeout=1000)
+        if not dialogs.count() and not details_were_open and self.page.url != before:
+            try:
+                details.wait_for(timeout=5000)
+            except Exception:
+                self.check_session()
         if not dialogs.count() and not details_were_open and details.count() == 1:
-            return details.inner_text(timeout=1000)
+            parking = visible(details.locator("xpath=ancestor::app-parking[1]"))
+            return (parking if parking.count() == 1 else details).inner_text(timeout=1000)
         if not dialogs.count() and self.page.url != before:
             route = urlsplit(self.page.url)
             detail_route = re.compile(r"/(?:bookings?|reservations?)/[^/]+(?:/details)?/?$")

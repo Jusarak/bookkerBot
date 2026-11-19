@@ -311,6 +311,25 @@ class CancellationCommandTests(unittest.TestCase):
         self.form.delete.click.assert_called_once()
         self.assertEqual(self.form.records, [readback, self.form.neighbor])
 
+    def test_reference_only_in_linked_details(self):
+        row = "November 26, 2026\nSpace: PTQ-123\nNEWTON, Parking Torres Quevedo"
+        self.form.records[0] = self.form.target = row
+        self.form.linked[row] = "Booking reference: OFFLINE-123"
+        self.assertEqual(self.run_command("--reference", "OFFLINE-123")["outcome"], "preview")
+        self.assertEqual(self.form.detail_reads, [row])
+        self.form.trigger.click.assert_not_called()
+
+    def test_missing_space_on_saved_cancellation_is_resolved_before_reporting_absence(self):
+        row = "November 26, 2026\nNEWTON, Parking Torres Quevedo"
+        self.form.linked[row] = "Space: PTQ-123"
+        self.form.delete.click.side_effect = lambda **kw: self.form.records.__setitem__(0, row)
+        args = (*self.selector, "--confirm", "--submission-state", str(self.state))
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.form.linked.clear()
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.form.delete.click.assert_called_once()
+
     def test_sparse_location_match_still_checks_linked_ambiguity(self):
         sparse = "November 26, 2026\nPTQ-123"
         self.form.records.append(sparse)
@@ -889,6 +908,36 @@ class ParkingCommandTests(unittest.TestCase):
             with self.assertRaisesRegex(BookingProblem, "period could not be verified"):
                 form.bookings("about:blank", day, reload=True)
         upcoming.click.assert_not_called()
+
+    def test_material_empty_list_rejects_upcoming_marker_for_a_past_date(self):
+        page = Mock()
+        view = page.locator.return_value.filter.return_value
+        view.count.return_value = 1
+        history = locator()
+        history.get_attribute.return_value = "true"
+        view.get_by_role.side_effect = lambda role, name=None: (
+            history if role == "tab" and name.fullmatch("Past bookings") else locator(0)
+        )
+        material = view.first
+        material.evaluate.return_value = True
+        material.inner_text.return_value = "No upcoming bookings"
+        marker = locator(text="No upcoming bookings")
+        material.locator.side_effect = lambda selector: marker if selector == ":scope > div.empty" else locator(0)
+        view.locator.return_value.and_.return_value.and_.return_value.filter.return_value.count.return_value = 0
+        form = ParkingForm(page)
+        with (patch("parking_booking.datetime", RunDate), patch.object(form, "check_session"),
+              patch.object(form, "in_bookings", return_value=True),
+              patch.object(form, "select_booking_period", return_value=locator(text="All past bookings")),
+              patch.object(form, "label", return_value=locator(0))):
+            with self.assertRaisesRegex(BookingProblem, "period could not be verified"):
+                form.bookings("about:blank", date(2026, 11, 19), reload=True)
+
+    def test_material_card_location_after_schedule(self):
+        from parking_booking import shows_location
+        row = "Space A1\nschedule 7:00 AM - 11:00 PMNEWTON, Parking Superficie C, other detail"
+        self.assertTrue(shows_location(row, "NEWTON", "Parking Superficie C"))
+        self.assertFalse(shows_location(row, "NEWTON", "Parking Superficie"))
+        self.assertFalse(shows_location(row, "NEWTON", "other detail"))
 
     def test_bookings_card_wrapping_the_period_and_empty_state(self):
         page = Mock(url="https://bookker.test/#/bookings")

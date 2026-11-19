@@ -7,7 +7,7 @@ from datetime import date
 
 from parking_booking import (
     MADRID, SIGN_IN, SPACE_CODE, SPACE_FIELD, BookingProblem, ParkingForm,
-    booking_references, booking_space, dates, field_values, intervals,
+    booking_references, booking_space, card_location, dates, field_values, intervals,
     normalized, outcome, shows, shows_location, visible, write_json,
 )
 
@@ -48,22 +48,22 @@ def booking_location(text):
         names = re.split(r"\s*[,/|·]\s*", label.strip().rstrip(","))
         if len(names) == 2 and all(names) and shows_location(text, *names):
             return tuple(names)
-    return None
+    return card_location(text)
 
 
 def find_reservation(records, target, form, base_url, day):
     matches = []
     location = (target.building, target.floor) if target.building else None
     for record in records:
-        if target.reference:
-            if target.reference not in booking_references(record):
-                continue
-        else:
-            days = dates(record, form.day_first)
+        days = dates(record, form.day_first)
+        if day and days and day not in days:
+            continue
+        refs = booking_references(record)
+        if target.reference and refs and target.reference not in refs:
+            continue
+        if target.space:
             labelled_spaces = {normalized(value) for value in field_values(record, SPACE_FIELD)}
-            if days and day not in days:
-                continue
-            if not (shows(record, SPACE_FIELD, target.space) or normalized(target.space) in labelled_spaces):
+            if labelled_spaces and normalized(target.space) not in labelled_spaces:
                 continue
             if not shows_location(record, *location) and booking_location(record):
                 continue
@@ -83,30 +83,40 @@ def reservation_details(record, target, requested_location, form, base_url, day)
         return booking_location(text)
 
     location = location_in(record)
-    space = target.space or booking_space(record)
-    if not space:
-        row = form.booking_row(base_url, day, record)
-        name = visible(row.locator(".resource-name, .booking-name, [data-testid=booking-space]"))
-        if name.count() == 1:
-            candidate = name.inner_text(timeout=1000).strip()
-            if re.fullmatch(SPACE_CODE, candidate) and shows(record, SPACE_FIELD, candidate):
-                space = candidate
+    def space_in(text):
+        if target.space and shows(text, SPACE_FIELD, target.space):
+            return target.space
+        return booking_space(text)
 
+    space = space_in(record)
     days = dates(record, form.day_first)
     references = booking_references(record)
     hours = intervals(record)
     linked = ""
-    if not (location and space and days):
+    if not (location and space and days) or (target.reference and not references):
         linked = form.booking_details(base_url, day, record, space)
         linked_location = location_in(linked)
         if linked_location and location and not shows_location(linked, *location):
             raise BookingProblem("The linked booking details showed a different location.", CANCEL_CHECK)
         location = location or linked_location
-        space = space or booking_space(linked)
+        space = space or space_in(linked)
         days |= dates(linked, form.day_first)
         references |= booking_references(linked)
         hours = hours or intervals(linked)
 
+    if target.reference and not references:
+        raise BookingProblem("A possible reservation did not show a verifiable reference.", CANCEL_CHECK)
+    if target.reference and target.reference not in references:
+        return None
+    if not space:
+        row = form.booking_row(base_url, day, record)
+        name = visible(row.locator(".resource-name, .booking-name, [data-testid=booking-space], [role=link] .strong"))
+        if name.count() == 1:
+            candidate = name.inner_text(timeout=1000).strip()
+            if re.fullmatch(SPACE_CODE, candidate) and shows(record, SPACE_FIELD, candidate):
+                space = candidate
+    if target.space and space and normalized(target.space) != normalized(space):
+        return None
     if not location or not space:
         raise BookingProblem("Bookker did not show the parking space and location for the selected reservation.",
                              CANCEL_CHECK)
