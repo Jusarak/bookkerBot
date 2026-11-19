@@ -276,11 +276,20 @@ offset to measure worker startup delay. Subtract `submit_dispatch` from
 including Bookker and UI/readback latency. The remote confirmation time and
 availability of any particular space depend on Bookker.
 
+The worker caps browser waits by the remaining release window before submission.
+A cutoff before any click reports `missed`. If Bookker offers a separate
+confirmation after the first click, the worker waits for its verified control
+to become enabled within the same release window. Once any click could have
+reached Bookker, the worker gives the Bookings readback a separate 20-second
+budget, including when the release window has closed.
+
 For `uncertain`, keep the date-keyed intent and sidecars under
 `/var/lib/bookker-parking/` and check that target in Bookings. A repeated trigger
 within its release window reloads Bookings to reconcile the saved selection. The
 worker exits `uncertain` when the readback is inconclusive and retains the same
 intent for review. `error` and `uncertain` produce a failed oneshot result.
+If Bookker asks for sign-in during readback, the worker also logs
+`expiry_alert` and uses the normal one-alert-per-session policy.
 
 ## Disable and roll back
 
@@ -331,6 +340,17 @@ exit followed at +80 ms. The fixture rejects any post-release network-idle
 wait and checks that the intent exists at the click. The offsets are synthetic
 and exclude real Playwright, disk and network overhead. Use journal offsets
 to measure the host after deployment.
+
+In the delayed search fixture, the previous list remains visible until 150 ms
+after Search. The worker ignores it and submits the newly rendered selection at
++175 ms. The DOM guard excludes prior rows and empty messages until the search
+changes their result data or replaces them. A UI that returns the same DOM and
+data without a verifiable new render times out. A search dispatched 40 ms before
+cutoff exits as `missed` at cutoff without an intent. A separate confirmation
+fixture dispatches at +70 ms, 10 ms after the first click, when its control
+becomes enabled. The durable final confirmation claim exists at the click.
+The expiry-on-readback fixture keeps the intent and returns `uncertain` with
+a failing exit status, sending one synthetic alert across two attempts.
 
 The phone fixture runs the renewal entry point, dispatches HTTP requests
 through the production handler and substitutes a local identity provider and

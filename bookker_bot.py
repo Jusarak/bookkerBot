@@ -79,7 +79,7 @@ class BookkerClient:
     # ---------- lifecycle ----------
 
     def _launch(self, storage_state: Optional[str] = None, force_headful: bool = False,
-                timezone_id: Optional[str] = None):
+                timezone_id: Optional[str] = None, wait_timeout=None):
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
@@ -88,6 +88,7 @@ class BookkerClient:
             channel=self.channel,
             headless=(self.headless and not force_headful),
             slow_mo=self.slow_mo_ms,
+            **({"timeout": wait_timeout(30_000)} if wait_timeout else {}),
         )
         self.context = self.browser.new_context(storage_state=storage_state, timezone_id=timezone_id)
         self.page = self.context.new_page()
@@ -143,15 +144,18 @@ class BookkerClient:
         print(f"[bookker] Saved auth to {self.auth_state_path.resolve()}")
         self.close()
 
-    def open_with_session(self, *, timezone_id: Optional[str] = None, wait_for_idle: bool = True):
+    def open_with_session(self, *, timezone_id: Optional[str] = None, wait_for_idle: bool = True,
+                          wait_timeout=None):
         """
         Opens Edge reusing stored session (no 2FA while valid).
         """
         if not self.auth_state_path.exists():
             raise FileNotFoundError(f"Auth state not found: {self.auth_state_path}. Run save_session() first.")
-        self._launch(storage_state=str(self.auth_state_path), timezone_id=timezone_id)
+        launch_options = {"wait_timeout": wait_timeout} if wait_timeout else {}
+        self._launch(storage_state=str(self.auth_state_path), timezone_id=timezone_id, **launch_options)
         assert self.page
-        self.page.goto(self.base_url, wait_until="domcontentloaded")
+        navigation_options = {"timeout": wait_timeout(30_000)} if wait_timeout else {}
+        self.page.goto(self.base_url, wait_until="domcontentloaded", **navigation_options)
         if wait_for_idle:
             self.page.wait_for_load_state("networkidle", timeout=15_000)
 

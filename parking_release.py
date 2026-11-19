@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bookker_bot import BookkerClient
-from parking_booking import ReleaseClosed, book_parking
+from parking_booking import BookingProblem, ReleaseClosed, book_parking
 from parking_notify import RenewalMail, alert_expiry, session_generation
 from parking_schedule import EXAMPLE, PRODUCTION, WARMUP, ZONE, render_timer
 
@@ -20,6 +20,9 @@ class WallClock:
 
     def sleep(self, seconds):
         time.sleep(seconds)
+
+    def monotonic(self):
+        return time.monotonic()
 
 
 def journal(record):
@@ -56,9 +59,30 @@ class ReleaseWindow:
 
     def remaining(self, *, at=None):
         at = at if at is not None else self.clock.now()
-        if not self.occurrence.release <= at < self.occurrence.close:
+        if at < self.occurrence.release:
             raise ReleaseClosed
-        return (self.occurrence.close - at).total_seconds()
+        return self.preparation_remaining(at=at)
+
+    def preparation_remaining(self, *, at=None):
+        at = at if at is not None else self.clock.now()
+        seconds = (self.occurrence.close - at).total_seconds()
+        if seconds <= 0:
+            raise ReleaseClosed
+        return seconds
+
+    def closed(self):
+        return self.clock.now() >= self.occurrence.close
+
+    def readback_budget(self):
+        deadline = self.clock.monotonic() + 20
+
+        def remaining():
+            seconds = deadline - self.clock.monotonic()
+            if seconds <= 0:
+                raise BookingProblem("Reloaded Bookings could not be verified within the readback limit.")
+            return seconds
+
+        return remaining
 
     def dispatch(self, event):
         at = self.clock.now()
@@ -110,7 +134,7 @@ def run_release(schedule, clock, state, make_client, emit, *, dry_run):
             if result.get("dry_run"):
                 status = "preview"
             message = result.get("reason", "Reloaded Bookings verified the reservation.")
-            if status == "auth_required" and not dry_run:
+            if (status == "auth_required" or result.get("session_expired")) and not dry_run:
                 try:
                     notice = alert_expiry(session, generation, occurrence, RenewalMail)
                 except OSError:
