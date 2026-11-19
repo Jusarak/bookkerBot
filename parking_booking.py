@@ -50,6 +50,9 @@ BOOKING_ROWS = (
     "tbody tr, [role=row]:not(:has([role=columnheader])), "
     "[data-testid=booking], [data-testid=booking-row], [data-testid=booking-card]"
 )
+BOOKING_ARTICLE = "article.list-container"
+BOOKING_LIST_ROWS = f"{BOOKING_ROWS}, mat-list-item, [role=listitem]"
+BOOKING_LOADING = "[aria-busy=true], [role=progressbar], mat-spinner, mat-progress-spinner"
 CONFIRMED_STATUS = re.compile(r"confirmed|booked|reserved|approved|confirmad[ao]|reservad[ao]|aprobad[ao]", re.I)
 INACTIVE = re.compile(r"cancelled|canceled|expired|rejected|rechazad[ao]|cancelad[ao]|caducad[ao]", re.I)
 UNVERIFIED_STATUS = re.compile(r"pending(?: approval)?|requested|pendiente(?: de aprobación)?", re.I)
@@ -235,9 +238,9 @@ def fields(text):
     return [part.strip() for part in re.split(r"[\n·|]", text) if part.strip()]
 
 
-def field_values(text, labels):
+def field_values(text, labels, *, split_inline=True):
     pattern = re.compile(rf"^(?:{labels})(?:\s*:\s*(.+))?$", re.I)
-    parts = fields(text)
+    parts = fields(text) if split_inline else [line.strip() for line in text.splitlines() if line.strip()]
     for index, part in enumerate(parts):
         match = pattern.fullmatch(part)
         if match:
@@ -267,20 +270,28 @@ def shows(text, labels, value):
 
 def shows_location(text, building, floor):
     building_labels, floor_labels = r"Building|Edificio", r"Floor|Planta"
-    for labels, wanted in ((building_labels, building), (floor_labels, floor)):
-        values = {normalized(value) for value in field_values(text, labels)}
-        if values and values != {normalized(wanted)}:
-            return False
-    first, second = (re.escape(normalized(value)) for value in (building, floor))
+    building_name, floor_name = normalized(building), normalized(floor)
+    first, second = re.escape(building_name), re.escape(floor_name)
     separator = r"(?:\s*[-–—/,·•|]\s*|\s+)"
     pair = re.compile(rf"(?:{first}{separator}{second}|{second}{separator}{first}|"
-                      rf"{first}\s*\({second}\)|{second}\s*\({first}\))")
+                      rf"{first}\s*\({second}\)|{second}\s*\({first}\))(?:\s*,)?")
+    floors = {normalized(value) for value in field_values(text, floor_labels)}
+    if floors and floors != {floor_name}:
+        return False
+    buildings = {normalized(value) for value in field_values(text, building_labels)}
+    combined = buildings - {building_name}
+    if combined:
+        # The resource dialog displays the combined location under Building.
+        # Verify the entire value before accepting its delimited components.
+        full_values = {normalized(value) for value in field_values(text, building_labels, split_inline=False)}
+        if not combined <= full_values or any(not pair.fullmatch(value) for value in combined):
+            return False
     lines = [re.sub(r"^(?:location_on|place)\s+", "", normalized(line)) for line in text.splitlines()]
-    location_label = re.compile(r"^(?:location|ubicación)\s*:\s*")
-    labelled = [location_label.sub("", line) for line in lines if location_label.match(line)]
-    if labelled and any(labelled):
+    labelled = list(field_values("\n".join(lines), r"Location|Ubicación", split_inline=False))
+    if labelled:
         return all(pair.fullmatch(line) for line in labelled)
-    return (shows(text, building_labels, building) and shows(text, floor_labels, floor)
+    return (bool(combined)
+            or (shows(text, building_labels, building) and shows(text, floor_labels, floor))
             or any(pair.fullmatch(line) for line in lines))
 
 
@@ -876,13 +887,49 @@ class ParkingForm:
 
         navigation = ":is(nav, aside, [role=navigation], [role=complementary])"
         content = view.locator(f":not({navigation}, {navigation} *)")
-        rows = visible(view.locator(f"{BOOKING_ROWS}, mat-card, [role=listitem], article").and_(content))
-        empty = visible(view.get_by_text(NO_BOOKINGS).and_(content)).first
+        loading = visible(view.locator(BOOKING_LOADING).and_(content)).first
+        results_action = "Check that the selected Bookings period has finished loading."
+        with self.parking_step("Bookker did not finish loading the selected Bookings period.", results_action):
+            loading.wait_for(state="hidden", timeout=10_000)
+        articles = visible(view.locator(f"{BOOKING_ARTICLE}:not({navigation} *)"))
+        article_count = articles.count()
+        if article_count > 1:
+            raise BookingProblem("Bookker showed multiple active booking results lists.")
+        if article_count == 1:
+            # The card around the Angular tabs is layout. Only the active
+            # results article and its children can supply reservation records.
+            explicit_rows = BOOKING_LIST_ROWS
+            nested = visible(articles.locator(f"{explicit_rows}, mat-card, article"))
+            rows = articles.or_(nested)
+            empty = visible(articles.locator(".empty").and_(articles.get_by_text(NO_BOOKINGS)))
+            empty_articles = visible(articles.and_(view.locator("article.empty-list")))
+            outside = visible(view.locator(BOOKING_ROWS).and_(content).and_(
+                view.locator(f":not({BOOKING_ARTICLE} *)")
+            ))
+        else:
+            explicit_rows = BOOKING_ROWS
+            rows = visible(view.locator(f"{explicit_rows}, mat-card, [role=listitem], article").and_(content))
+            empty = visible(view.get_by_text(NO_BOOKINGS).and_(content)).first
         period_text = re.escape(normalized(period.inner_text()))
         period_layout = rf"(?:(?:booking )?(?:period|date range)\s*:?\s*)?(?:{period_text})?"
         result = []
         seen = set()
         while True:
+            if article_count == 1:
+                with self.parking_step("Bookker did not show the results for the selected Bookings period.",
+                                       results_action):
+                    nested.or_(empty).first.wait_for(timeout=10_000)
+                empty_count = empty.count()
+                empty_article_count = empty_articles.count()
+                if empty_count or empty_article_count:
+                    if (empty_count != 1 or empty_article_count != 1
+                            or normalized(articles.inner_text()) != normalized(empty.inner_text())
+                            or nested.count() or outside.count()):
+                        raise BookingProblem("Bookker showed conflicting content in its Bookings empty list.",
+                                             "Check which reservations are shown for the selected period in Bookker.")
+                elif outside.count():
+                    raise BookingProblem("Bookker showed reservation rows outside its active results list.",
+                                         "Check which reservations are shown for the selected period in Bookker.")
             cards = rows.evaluate_all(r"""(rows, bookingRows) => {
                 const explicit = rows.filter(row => row.matches(bookingRows));
                 // Generic cards inside an explicit row are part of that row.
@@ -915,7 +962,7 @@ class ParkingForm:
                     }
                     return [fragments.concat(remainder).join(' ').trim(), 'layout'];
                 });
-            }""", BOOKING_ROWS)
+            }""", explicit_rows)
             empty_text = normalized(empty.inner_text()) if empty.count() else ""
             layout = period_layout
             if empty_text:
@@ -949,6 +996,8 @@ class ParkingForm:
                 return result
             following.click()
             self.settled()
+            with self.parking_step("Bookker did not finish loading the next Bookings page.", results_action):
+                loading.wait_for(state="hidden", timeout=10_000)
 
 
 def parking_dates(records, form):

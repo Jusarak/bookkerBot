@@ -14,8 +14,9 @@ from zoneinfo import ZoneInfo
 
 import run_bookker
 from parking_booking import (
-    NO_BOOKINGS, TORRES_SHIFTS, BookingProblem, ParkingForm, Selection, SpaceChoice, dates, intervals, period_covers,
-    parking_dates, read_intent, verify_booking, write_json,
+    BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, NO_BOOKINGS, TORRES_SHIFTS, BookingProblem,
+    ParkingForm, Selection, SpaceChoice, dates, intervals, parking_dates, period_covers, read_intent, verify_booking,
+    write_json,
 )
 
 
@@ -345,6 +346,7 @@ class ParkingCommandTests(unittest.TestCase):
         empty.inner_text.return_value = "info You do not have any bookings for the selected period yet"
         view.get_by_role.return_value.filter.return_value.first.count.return_value = 0
         cards = view.locator.return_value.and_.return_value.filter.return_value
+        view.locator.return_value.filter.return_value.count.return_value = 0
         wrapper = f"Period\nThis week\n{empty.inner_text.return_value}"
         cards.evaluate_all.return_value = [(wrapper, "card")]
         form = ParkingForm(page)
@@ -371,6 +373,89 @@ class ParkingCommandTests(unittest.TestCase):
             cards.evaluate_all.return_value = [(MATCH, "card")]
             self.assertEqual(form.bookings("https://bookker.test/", day, reload=False), [MATCH])
 
+    def test_bookings_reads_the_active_material_results_article(self):
+        page = Mock(url="https://bookker.test/#/bookings")
+        view = page.locator.return_value.filter.return_value
+        view.count.return_value = 1
+        base_locator = view.locator.return_value
+        article_locator, flag_locator, loader_locator = Mock(), Mock(), Mock()
+        view.locator.side_effect = lambda selector: (
+            article_locator if selector.startswith(f"{BOOKING_ARTICLE}:not(") else {
+                "article.empty-list": flag_locator, BOOKING_LOADING: loader_locator,
+            }.get(selector, base_locator)
+        )
+        article = article_locator.filter.return_value
+        article.count.return_value = 1
+        marker_locator, nested_locator = Mock(), Mock()
+        article.locator.side_effect = {
+            ".empty": marker_locator, f"{BOOKING_LIST_ROWS}, mat-card, article": nested_locator,
+        }.__getitem__
+        marker = marker_locator.and_.return_value.filter.return_value
+        marker.count.return_value = 1
+        message = "You don't have any reservations for the selected period yet."
+        marker.inner_text.return_value = message
+        article.inner_text.return_value = message
+        flag = article.and_.return_value.filter.return_value
+        flag.count.return_value = 1
+        nested = nested_locator.filter.return_value
+        nested.count.return_value = 0
+        rows = article.or_.return_value
+        rows.evaluate_all.return_value = [(message, "card")]
+        sibling_rows = base_locator.and_.return_value.and_.return_value.filter.return_value
+        sibling_rows.count.return_value = 0
+        sibling_rows.evaluate_all.side_effect = AssertionError("Layout card must stay outside the results")
+        view.get_by_role.return_value.filter.return_value.first.count.return_value = 0
+        period = view.get_by_label.return_value.filter.return_value
+        period.evaluate.return_value = False
+        period.inner_text.side_effect = ["This week", "This month", "This month"]
+        month = Mock()
+        month.inner_text.return_value = "This month"
+        page.get_by_role.return_value.or_.return_value.filter.return_value.all.return_value = [month]
+        loading = loader_locator.and_.return_value.filter.return_value.first
+        ready = nested.or_.return_value.first
+        form = ParkingForm(page)
+        day = date(2026, 11, 26)
+
+        def read():
+            return form.bookings("https://bookker.test/", day, reload=False)
+
+        def check_wait_order(**kwargs):
+            month.click.assert_called_once()
+            loading.wait_for.assert_called_once_with(state="hidden", timeout=10_000)
+
+        with patch("parking_booking.datetime", RunDate), patch.object(form, "check_session"), patch.object(
+            form, "label", return_value=Mock(**{"count.return_value": 0})
+        ):
+            ready.wait_for.side_effect = check_wait_order
+            self.assertEqual(read(), [])
+            ready.wait_for.side_effect = None
+            period.inner_text.side_effect = None
+            period.inner_text.return_value = "This month"
+            marker_locator.and_.assert_called_with(article.get_by_text.return_value)
+            article.get_by_text.assert_called_with(NO_BOOKINGS)
+
+            for source in (nested, sibling_rows):
+                source.count.return_value = 1
+                with self.assertRaisesRegex(BookingProblem, "conflicting content"):
+                    read()
+                source.count.return_value = 0
+            article.inner_text.return_value = f"{message}\n{MATCH}"
+            with self.assertRaisesRegex(BookingProblem, "conflicting content"):
+                read()
+
+            flag.count.return_value = 0
+            marker.count.return_value = 0
+            nested.count.return_value = 2
+            first = MATCH.strip().replace("November 23", "November 26")
+            second = first.replace("PTQ-123", "PTQ-124")
+            rows.evaluate_all.return_value = [("", "layout"), (first, "row"), (second, "row")]
+            self.assertEqual(read(), [first, second])
+            self.assertEqual(parking_dates(read(), form), {day})
+            self.assertEqual(rows.evaluate_all.call_args.args[1], BOOKING_LIST_ROWS)
+            sibling_rows.count.return_value = 1
+            with self.assertRaisesRegex(BookingProblem, "outside its active results list"):
+                read()
+
     def test_bookings_callback_keeps_explicit_rows_separate_inside_a_card(self):
         node = shutil.which("node")
         playwright = importlib.util.find_spec("playwright")
@@ -388,6 +473,7 @@ class ParkingCommandTests(unittest.TestCase):
         empty.count.return_value = 0
         view.get_by_role.return_value.filter.return_value.first.count.return_value = 0
         cards = view.locator.return_value.and_.return_value.filter.return_value
+        view.locator.return_value.filter.return_value.count.return_value = 0
         period = Mock()
         period.inner_text.return_value = "This week"
         day = date(2026, 11, 23)
@@ -628,7 +714,7 @@ class ParkingCommandTests(unittest.TestCase):
         list_button = list_role.or_.return_value.filter.return_value
         list_button.count.return_value = 1
         dialog = dialog_element.filter.return_value
-        dialog_text = "PTQ-123\nNEWTON / Parking Torres Quevedo\nBook"
+        dialog_text = "PTQ-123\nBuilding\nNEWTON, Parking Torres Quevedo\nBook"
         dialog.inner_text.return_value = dialog_text
         submit = dialog.get_by_role.return_value.filter.return_value
         submit.count.return_value = 1
@@ -663,8 +749,16 @@ class ParkingCommandTests(unittest.TestCase):
 
         partial, partial_button = resource_row("PTQ-101", "07:00–14:00", "NEWTON / Parking Torres Quevedo")
         elsewhere, elsewhere_button = resource_row("PTQ-102", "07:00–23:00", "NEWTON / Visitor Parking")
-        full, full_button = resource_row("PTQ-123", "07:00–23:00", "NEWTON / Parking Torres Quevedo")
-        rows.filter.return_value.all.return_value = [partial, elsewhere, full]
+        wrong_floor, wrong_floor_button = resource_row(
+            "PTQ-103", "07:00–23:00", "NEWTON, Parking Torres Quevedo, Visitor Parking",
+        )
+        wrong_site, wrong_site_button = resource_row(
+            "PTQ-104", "07:00–23:00", "NEWTON ANNEX, Parking Torres Quevedo,",
+        )
+        full, full_button = resource_row(
+            "PTQ-123", "07:00–23:00", "location_on NEWTON, Parking Torres Quevedo,\nLevel detail",
+        )
+        rows.filter.return_value.all.return_value = [partial, elsewhere, wrong_floor, wrong_site, full]
         form = ParkingForm(page)
         building, floor, span = "NEWTON", "Parking Torres Quevedo", ("07:00", "23:00")
         with patch.object(form, "location"), patch.object(form, "label", return_value=Mock(**{"count.return_value": 0})):
@@ -675,6 +769,8 @@ class ParkingCommandTests(unittest.TestCase):
             control.click.assert_not_called()
         partial_button.click.assert_not_called()
         elsewhere_button.click.assert_not_called()
+        wrong_floor_button.click.assert_not_called()
+        wrong_site_button.click.assert_not_called()
         full_button.click.assert_called_once()
         self.assertEqual(choice, SpaceChoice("PTQ-123", material=True))
 
@@ -683,9 +779,16 @@ class ParkingCommandTests(unittest.TestCase):
         self.assertEqual(selection.space, "PTQ-123")
         self.assertIs(control, submit)
         for detail in ("November 27, 2026", "Date: 11/27", "07:00–14:00", "Vehicle: another vehicle",
-                       "Building: OTHER", "Location: NEWTON / Visitor Parking", "Space: PTQ-124"):
+                       "Building: OTHER", "Floor: Visitor Parking", "Location: NEWTON / Visitor Parking",
+                       "Space: PTQ-124"):
             with self.subTest(detail=detail):
                 dialog.inner_text.return_value = f"{dialog_text}\n{detail}"
+                with self.assertRaises(BookingProblem):
+                    form.review(*args)
+        for bad_location in ("OTHER, Parking Torres Quevedo", "NEWTON, Parking Torres Quevedo, Visitor Parking",
+                             "NEWTON, Parking Torres Quevedo | Visitor Parking"):
+            with self.subTest(bad_location=bad_location):
+                dialog.inner_text.return_value = dialog_text.replace("NEWTON, Parking Torres Quevedo", bad_location)
                 with self.assertRaises(BookingProblem):
                     form.review(*args)
         dialog.inner_text.return_value = dialog_text
