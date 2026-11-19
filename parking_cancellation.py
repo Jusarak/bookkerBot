@@ -334,14 +334,18 @@ def reservation_remaining(records, details, form, base_url, day):
     location = details["building"], details["floor"]
     space = details["space"]
     if reference:
+        saved_location = f"Building: {location[0]}\nFloor: {location[1]}"
         for record in records:
             shown_days = dates(record, form.day_first)
             if not shown_days or shown_days == {day}:
                 continue
             references = booking_references(record)
-            if (not references and shows_location(record, *location)
-                    and normalized(space) in displayed_spaces(record, form.day_first, location)):
-                linked = form.booking_details(base_url, day, record, space)
+            if not references:
+                title = displayed_spaces(record, form.day_first, location).get(normalized(space))
+                # Supply missing location fields so the check only rejects conflicts.
+                if not title or not shows_location(f"{record}\n{saved_location}", *location):
+                    continue
+                linked = form.booking_details(base_url, day, record, title)
                 references = booking_references(linked)
                 if len(references) != 1 and reference not in references:
                     raise BookingProblem("The linked reference for a Bookings row with a different date "

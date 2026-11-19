@@ -557,6 +557,41 @@ class CancellationCommandTests(unittest.TestCase):
         self.form.trigger.click.assert_called_once()
         self.form.delete.click.assert_called_once()
 
+    def test_cancel_readback_checks_changed_date_when_card_location_is_incomplete(self):
+        for index, location in enumerate(("", "Building: NEWTON", "Floor: Parking Torres Quevedo")):
+            with self.subTest(location=location):
+                self.form = CancellationFixture()
+                state = self.state.with_name(f"moved-{index}.json")
+                details = self.form.target
+                card = details.replace("\nConfirmation reference: OFFLINE-123", "")
+                self.form.target = self.form.records[0] = card
+                self.form.row.inner_text.return_value = card
+                self.form.linked[card] = details
+                moved = f"November 27, 2026\nPTQ-123\n{location}".strip()
+                self.form.linked[moved] = details.replace("November 26", "November 27")
+                unrelated = ["November 27, 2026\nPTQ-125",
+                             "November 27, 2026\nPTQ-123\nBuilding: OTHER BUILDING",
+                             "November 27, 2026\nPTQ-123\nFloor: Parking Superficie C"]
+
+                def change_date(**kwargs):
+                    saved = json.loads(state.read_text())["reservation"]
+                    self.assertEqual(saved.get("confirmation_reference"), "OFFLINE-123")
+                    self.form.records[:] = [*unrelated, moved, self.form.neighbor]
+
+                self.form.delete.click.side_effect = change_date
+                args = (*self.selector, "--confirm", "--submission-state", str(state))
+                for _ in range(2):
+                    result = self.run_command(*args)
+                    self.assertEqual(result["outcome"], "unknown")
+                    self.assertIn("different date", result["reason"])
+                    self.assertEqual(self.form.records, [*unrelated, moved, self.form.neighbor])
+
+                self.form.records.remove(moved)
+                self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+                self.assertEqual(self.form.records, [*unrelated, self.form.neighbor])
+                self.assertEqual(self.form.detail_reads, [card, moved, moved])
+                self.form.delete.click.assert_called_once()
+
     def test_location_cancellation_saves_linked_reference_before_delete(self):
         details = self.form.target
         card = details.replace("\nConfirmation reference: OFFLINE-123", "")
