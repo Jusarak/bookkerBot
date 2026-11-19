@@ -735,7 +735,7 @@ class ParkingCommandTests(unittest.TestCase):
             "mat-dialog-container": dialog_element,
         }.get(selector, base_locator)
 
-        def resource_row(name, hours, location):
+        def resource_row(name, hours, location, *, location_label=None):
             row = Mock()
             row.inner_text.return_value = f"{name}\n{hours}\n{location}"
             resource = row.locator.return_value.filter.return_value
@@ -744,7 +744,13 @@ class ParkingCommandTests(unittest.TestCase):
             names.filter.return_value.count.return_value = 1
             names.filter.return_value.inner_text.return_value = name
             clickable.filter.return_value.count.return_value = 1
-            resource.locator.side_effect = {".resource-name": names, ".resource.clickable": clickable}.__getitem__
+            icons = Mock()
+            icon = icons.filter.return_value
+            icon.count.return_value = int(location_label is not None)
+            icon.evaluate.return_value = location_label
+            resource.locator.side_effect = {
+                ".resource-name": names, ".resource.clickable": clickable, ".info mat-icon": icons,
+            }.__getitem__
             return row, clickable.filter.return_value
 
         partial, partial_button = resource_row("PTQ-101", "07:00–14:00", "NEWTON / Parking Torres Quevedo")
@@ -756,7 +762,8 @@ class ParkingCommandTests(unittest.TestCase):
             "PTQ-104", "07:00–23:00", "NEWTON ANNEX, Parking Torres Quevedo,",
         )
         full, full_button = resource_row(
-            "PTQ-123", "07:00–23:00", "location_on NEWTON, Parking Torres Quevedo,\nLevel detail",
+            "PTQ-123", "07:00–23:00", "schedule 7:00 AM - 11:00 PMlocation_on NEWTON, Parking Torres Quevedo, Floor detail",
+            location_label="NEWTON, Parking Torres Quevedo,",
         )
         rows.filter.return_value.all.return_value = [partial, elsewhere, wrong_floor, wrong_site, full]
         form = ParkingForm(page)

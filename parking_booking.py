@@ -637,6 +637,15 @@ class ParkingForm:
             "button", name=re.compile(r"^(?:(?:list|format_list_bulleted)\s+)?"
                                       r"(?:List(?: view)?|Show list|View list|Lista|Ver lista)$", re.I)
         ).or_(self.page.locator("button").filter(has_text=re.compile(r"^\s*(?:list|format_list_bulleted)\s*$"))))
+        if require_material:
+            resources = visible(self.page.locator("app-resources"))
+            resources.wait_for(timeout=10_000)
+            icon = self.page.locator("mat-icon").filter(has_text=re.compile(r"^\s*list\s*$", re.I))
+            toggle = visible(resources.locator("button").filter(has=icon))
+            material_list = visible(resources.locator("article.list-container"))
+            toggle.or_(material_list).first.wait_for(timeout=10_000)
+            if toggle.count() == 1:
+                list_button = toggle
         if list_button.count():
             with self.parking_step("The Bookker map's List button could not be opened.",
                                    "Check the enabled List button on the Bookker results map."):
@@ -648,7 +657,12 @@ class ParkingForm:
                 self.settled()
         if self.label(NO_SPACES).count():
             return None
-        material_rows = visible(self.page.locator("app-resources article.list-container mat-list-item")).all()
+        row_locator = visible(self.page.locator("app-resources article.list-container mat-list-item"))
+        if require_material:
+            row_locator.or_(self.label(NO_SPACES)).first.wait_for(timeout=10_000)
+            if self.label(NO_SPACES).count():
+                return None
+        material_rows = row_locator.all()
         if material_rows:
             return self.select_material_space(material_rows, building, floor, span, spot_name, spot_id)
         if require_material:
@@ -716,8 +730,19 @@ class ParkingForm:
             if not re.fullmatch(SPACE_CODE, name) or not hours:
                 unreadable = True
                 continue
-            if hours != {span} or not shows_location(text, building, floor) or not choose.is_enabled():
+            if hours != {span} or not choose.is_enabled():
                 continue
+            if not shows_location(text, building, floor):
+                # The location icon and child detail share a span with the two
+                # site names. Compare only the direct text that labels the site.
+                icon = resource.locator(".info mat-icon").filter(has_text=re.compile(r"^\s*location_on\s*$"))
+                if icon.count() != 1:
+                    continue
+                label = icon.evaluate("""e => [...e.parentElement.childNodes]
+                    .filter(node => node.nodeType === Node.TEXT_NODE)
+                    .map(node => node.textContent).join(' ').trim()""")
+                if not shows_location(label, building, floor):
+                    continue
             if spot_name and normalized(name) != normalized(spot_name):
                 continue
             if spot_id and spot_id not in (row.get_attribute("data-id"), resource.get_attribute("data-id"), name):
@@ -891,6 +916,24 @@ class ParkingForm:
         results_action = "Check that the selected Bookings period has finished loading."
         with self.parking_step("Bookker did not finish loading the selected Bookings period.", results_action):
             loading.wait_for(state="hidden", timeout=10_000)
+        # Scope the known Material empty state directly to its active results list.
+        lists = visible(self.page.locator("app-bookings article.list-container"))
+        try:
+            lists.first.wait_for(timeout=2500)
+        except Exception:
+            pass
+        if lists.count() == 1:
+            list_element = lists.first
+            empty_marker = visible(list_element.locator(":scope > div.empty"))
+            if (list_element.evaluate("el => el.classList.contains('empty-list')")
+                    and empty_marker.count() == 1
+                    and NO_BOOKINGS.fullmatch(empty_marker.inner_text().strip())
+                    and normalized(list_element.inner_text()) == normalized(empty_marker.inner_text())
+                    and not visible(list_element.locator(f"{BOOKING_LIST_ROWS}, mat-card, article")).count()
+                    and not visible(view.locator(BOOKING_ROWS).and_(content).and_(
+                        view.locator(f":not({BOOKING_ARTICLE} *)")
+                    )).count()):
+                return []
         articles = visible(view.locator(f"{BOOKING_ARTICLE}:not({navigation} *)"))
         article_count = articles.count()
         if article_count > 1:
