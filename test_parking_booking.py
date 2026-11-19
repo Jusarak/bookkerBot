@@ -1,6 +1,8 @@
 import contextlib
+import importlib.util
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -259,7 +261,7 @@ class ParkingCommandTests(unittest.TestCase):
         view.get_by_role.return_value.filter.return_value.first.count.return_value = 0
         cards = view.locator.return_value.and_.return_value.filter.return_value
         wrapper = f"Period\nThis week\n{empty.inner_text.return_value}"
-        cards.evaluate_all.return_value = [(wrapper, False)]
+        cards.evaluate_all.return_value = [(wrapper, "card")]
         form = ParkingForm(page)
         day = date(2026, 11, 20)
 
@@ -271,18 +273,85 @@ class ParkingCommandTests(unittest.TestCase):
             page.get_by_text.assert_not_called()
             view.get_by_text.assert_called_with(NO_BOOKINGS)
 
-            for rows in ([(wrapper, False), (MATCH, True)], [(f"{wrapper}\n{MATCH}", False)]):
+            for rows in ([(wrapper, "layout"), (MATCH, "row")], [(f"{wrapper}\n{MATCH}", "card")]):
                 with self.subTest(rows=rows):
                     cards.evaluate_all.return_value = rows
                     with self.assertRaisesRegex(BookingProblem, "alongside its Bookings empty state"):
                         form.bookings("https://bookker.test/", day, reload=False)
 
             empty.count.return_value = 0
-            cards.evaluate_all.return_value = [("Period\nThis week", False)]
+            cards.evaluate_all.return_value = [("Period\nThis week", "card")]
             with self.assertRaisesRegex(BookingProblem, "did not show a readable Bookings list or empty state"):
                 form.bookings("https://bookker.test/", day, reload=False)
-            cards.evaluate_all.return_value = [(MATCH, False)]
+            cards.evaluate_all.return_value = [(MATCH, "card")]
             self.assertEqual(form.bookings("https://bookker.test/", day, reload=False), [MATCH])
+
+    def test_bookings_callback_keeps_explicit_rows_separate_inside_a_card(self):
+        node = shutil.which("node")
+        playwright = importlib.util.find_spec("playwright")
+        if not node and playwright and playwright.origin:
+            driver = Path(playwright.origin).parent / "driver" / "node"
+            if driver.is_file():
+                node = str(driver)
+        if not node:
+            self.skipTest("JavaScript runtime is unavailable")
+
+        page = Mock(url="https://bookker.test/#/bookings")
+        view = page.locator.return_value.filter.return_value
+        view.count.return_value = 1
+        empty = view.get_by_text.return_value.and_.return_value.filter.return_value.first
+        empty.count.return_value = 0
+        view.get_by_role.return_value.filter.return_value.first.count.return_value = 0
+        cards = view.locator.return_value.and_.return_value.filter.return_value
+        period = Mock()
+        period.inner_text.return_value = "This week"
+        day = date(2026, 11, 23)
+        selection = Selection(day.isoformat(), "07:00", "23:00", "NEWTON",
+                              "Parking Torres Quevedo", "PTQ-123")
+
+        def evaluate(callback, selector, sibling, extra):
+            # Run the actual browser callback over a synthetic card and two rows.
+            fixture = r"""
+                const [callback, selector, first, second, extra] =
+                    JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+                const card = {
+                    innerText: ['Period', 'This week', first, second, extra].join('\n'),
+                    parentElement: null,
+                    matches: () => false,
+                };
+                const row = innerText => ({
+                    innerText, parentElement: card, matches: test => test === selector,
+                    contains(other) { return other === this; },
+                });
+                console.log(JSON.stringify(eval(callback)([card, row(first), row(second)], selector)));
+            """
+            result = subprocess.run(
+                [node, "-e", fixture], input=json.dumps([callback, selector, MATCH, sibling, extra]),
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            return json.loads(result.stdout)
+
+        sibling = MATCH.replace("OFFLINE-123", "OFFLINE-124")
+        form = ParkingForm(page)
+        with patch.object(form, "check_session"), patch.object(
+            form, "select_booking_period", return_value=period
+        ), patch.object(form, "label", return_value=Mock(**{"count.return_value": 0})):
+            cards.evaluate_all.side_effect = lambda *args: evaluate(*args, sibling, "")
+            records = form.bookings("about:blank", day, reload=False)
+            self.assertEqual(records, [MATCH.strip(), sibling.strip()])
+            result = verify_booking(records, selection, self.form, recovered=True)
+            self.assertEqual(result["outcome"], "unknown")
+            self.assertIn("multiple matching reservations", result["reason"])
+
+            rejected = sibling.replace("Status: Confirmed", "Status: Rejected")
+            cards.evaluate_all.side_effect = lambda *args: evaluate(*args, rejected, "")
+            records = form.bookings("about:blank", day, reload=False)
+            self.assertEqual(records, [MATCH.strip()])
+            self.assertEqual(parking_dates(records, self.form), {day})
+
+            cards.evaluate_all.side_effect = lambda *args: evaluate(*args, sibling, "Status: Pending")
+            with self.assertRaisesRegex(BookingProblem, "did not expose separate reservation rows"):
+                form.bookings("about:blank", day, reload=False)
 
     def test_named_and_explicit_bookings_periods_cover_the_candidate(self):
         today = date(2026, 11, 20)
@@ -307,15 +376,97 @@ class ParkingCommandTests(unittest.TestCase):
             morning.inner_text.return_value += "\nShift ended"
             self.assertIsNone(form.whole_day())
 
-    def test_home_opens_parking_with_the_add_booking_button(self):
-        page = Mock()
+    def test_home_opens_parking_and_reads_the_observed_material_controls(self):
+        page = Mock(url="https://bookker.test/#/home")
+        route = Mock()
+        route.filter.return_value.count.return_value = 1
+        fields = Mock()
+        captions = Mock()
+        page.locator.side_effect = {
+            'a[href$="/home"]': route, "mat-form-field": fields, "mat-label, label": captions,
+        }.__getitem__
+        links, parking, option = Mock(), Mock(), Mock()
+        links.filter.return_value.count.return_value = 2
+        option.filter.return_value.count.return_value = 1
+        page.get_by_role.side_effect = lambda role, **kwargs: {
+            "link": links, "button": parking, "option": option,
+        }[role]
+        by_caption = {}
+        controls = {}
+        for label, current in {
+            "Type": "Parking", "Building": "NEWTON", "Floor": "Other floor", "Vehicle": self.form.vehicle,
+        }.items():
+            caption = Mock()
+            caption.filter.return_value.first.count.return_value = 1
+            field = Mock()
+            by_caption[caption.and_.return_value] = field
+            control = field.locator.return_value.filter.return_value
+            control.count.return_value = 1
+            control.evaluate.return_value = current
+            controls[label] = caption, field, control
+        heading = Mock()
+        page.get_by_text.side_effect = lambda name, **kwargs: (
+            heading if name == "Parking space booking" else controls[name][0]
+        )
+        fields.filter.side_effect = lambda *, has: by_caption[has]
+        floor = controls["Floor"][2]
+        floor.evaluate.side_effect = ["Other floor", False, "Parking Torres Quevedo"]
         form = ParkingForm(page)
-        with patch.object(form, "check_session"), patch.object(form, "label"), patch.object(
-            form, "location"
-        ), patch.object(form, "selected_vehicle", return_value=self.form.vehicle):
+        with patch.object(form, "check_session"):
             self.assertEqual(form.open("NEWTON", "Parking Torres Quevedo"), self.form.vehicle)
-        page.get_by_role.return_value.click.assert_called_once()
-        self.assertRegex("Add parking booking", page.get_by_role.call_args.kwargs["name"])
+        route.filter.return_value.click.assert_called_once()
+        links.or_.assert_not_called()
+        parking.filter.return_value.click.assert_called_once()
+        button = next(call for call in page.get_by_role.call_args_list if call.args == ("button",))
+        self.assertRegex("add Add a Parking booking", button.kwargs["name"])
+        heading.filter.return_value.first.wait_for.assert_called_once()
+        for _, field, _ in controls.values():
+            field.locator.assert_called_with("mat-select")
+        floor.click.assert_called_once()
+        option.filter.return_value.first.click.assert_called_once()
+        controls["Vehicle"][2].click.assert_not_called()
+
+    def test_form_blocker_reports_the_first_failed_operation_at_the_cli(self):
+        for stage, reason, action in (
+            ("home", "Home navigation link", "Open Home from Bookker's sidebar"),
+            ("parking", "Add a Parking booking button", "Check that the Parking card"),
+            ("heading", "Parking space booking form", "Open the Parking card on Home"),
+            ("building", "parking Building control could not be read", "Check the Building dropdown"),
+            ("vehicle", "parking Vehicle control could not be read", "Select the intended vehicle"),
+        ):
+            with self.subTest(stage=stage):
+                page = Mock(url="https://bookker.test/#/home")
+                form = ParkingForm(page)
+                secret = "private browser error and vehicle"
+                error = RuntimeError(secret)
+                home = page.locator.return_value.filter.return_value
+                home.count.return_value = 1
+                parking = page.get_by_role.return_value.filter.return_value
+                heading = page.get_by_text.return_value.filter.return_value.first
+                heading.count.return_value = 0
+                form.check_session = Mock()
+                form.control = Mock(side_effect=lambda label: {
+                    "Building": Mock(evaluate=Mock(return_value="NEWTON")),
+                    "Floor": Mock(evaluate=Mock(return_value="Parking Torres Quevedo")),
+                }[label])
+                if stage in ("building", "vehicle"):
+                    control = form.control.side_effect
+                    form.control.side_effect = lambda label: (
+                        Mock(evaluate=Mock(side_effect=error)) if label.casefold() == stage else control(label)
+                    )
+                else:
+                    {"home": home.click, "parking": parking.click, "heading": heading.wait_for}[stage].side_effect = error
+                with patch.object(self.form, "open", side_effect=form.open):
+                    result = self.run_command("--confirm")
+                self.assertEqual(result["outcome"], "blocked")
+                self.assertIn(reason, result["reason"])
+                self.assertIn(action, result["next_action"])
+                self.assertNotIn(secret, self.form.receipt.read_text())
+                self.assertFalse(self.form.intent.exists())
+                if stage == "home":
+                    parking.click.assert_not_called()
+                if stage == "parking":
+                    heading.wait_for.assert_not_called()
 
     def test_space_search_continues_past_an_unmarked_row(self):
         page = Mock()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -295,11 +296,18 @@ class ParkingForm:
     def navigation(self, name):
         # Material icons can be included in the link's accessible name.
         link = self.page.get_by_role("link", name=re.compile(rf"\b{name}\b", re.I))
-        route = self.page.locator(f'a[href$="/{name.lower()}"]')
-        return visible(link.or_(route))
+        route = visible(self.page.locator(f'a[href$="/{name.lower()}"]'))
+        # The Home logo and side navigation both mention Home.
+        return route if route.count() == 1 else visible(link.or_(route))
 
     def control(self, label):
         page = self.page
+        caption = page.get_by_text(label, exact=True)
+        material = visible(page.locator("mat-form-field").filter(
+            has=caption.and_(page.locator("mat-label, label"))
+        ).locator("mat-select"))
+        if material.count():
+            return material
         labelled = visible(page.get_by_label(label, exact=True)).or_(
             visible(page.get_by_role("combobox", name=label, exact=True))
         ).first
@@ -307,7 +315,7 @@ class ParkingForm:
             return labelled
         # The illustrated Bookker form also uses controls with visual labels.
         caption = self.label(label)
-        caption.wait_for()
+        caption.wait_for(timeout=10_000)
         wrapper = caption.locator(
             "xpath=ancestor-or-self::*[self::label or self::mat-form-field or "
             "self::mat-select or self::button or self::ion-item or @role='combobox'][1]"
@@ -317,6 +325,12 @@ class ParkingForm:
     def value(self, control, label):
         return control.evaluate(
             """(el, label) => {
+                if (el.matches('mat-select')) {
+                    const value = el.querySelector('.mat-mdc-select-value, .mat-select-value');
+                    if (value) return (value.querySelector(
+                        '.mat-mdc-select-value-text, .mat-select-value-text'
+                    )?.innerText || '').trim();
+                }
                 const input = el.matches('input,select') ? el : el.querySelector('input,select');
                 if (input) return input.selectedOptions
                     ? (input.selectedOptions[0]?.textContent || '').trim() : input.value.trim();
@@ -326,27 +340,59 @@ class ParkingForm:
             }""", label
         )
 
+    @contextmanager
+    def parking_step(self, reason, next_action):
+        try:
+            yield
+        except BookingProblem:
+            raise
+        except Exception:
+            try:
+                self.check_session()
+            except BookingProblem:
+                raise
+            except Exception:
+                pass
+            raise BookingProblem(reason, next_action) from None
+
     def location(self, label, desired, *, select):
-        control = self.control(label)
-        if select and normalized(self.value(control, label)) != normalized(desired):
-            if control.evaluate("(el) => el.tagName === 'SELECT'"):
-                control.select_option(label=desired)
-            else:
-                control.click()
-                option = visible(self.page.get_by_role("option", name=desired, exact=True))
-                (option.first if option.count() else self.label(desired)).click()
-            self.settled()
-        if normalized(self.value(self.control(label), label)) != normalized(desired):
-            raise BookingProblem(f"Bookker did not show the requested {label.lower()} as selected.")
+        action = f"Check the {label} dropdown and its available options in the Bookker parking form."
+        with self.parking_step(f"Bookker's parking {label} control could not be read.", action):
+            control = self.control(label)
+            if normalized(self.value(control, label)) == normalized(desired):
+                return
+        if select:
+            with self.parking_step(f"The requested parking {label} could not be selected in Bookker.", action):
+                if control.evaluate("(el) => el.tagName === 'SELECT'"):
+                    control.select_option(label=desired, timeout=10_000)
+                else:
+                    control.click(timeout=10_000)
+                    option = visible(self.page.get_by_role("option", name=desired, exact=True))
+                    (option.first if option.count() else self.label(desired)).click(timeout=10_000)
+                self.settled()
+            with self.parking_step(f"Bookker's selected parking {label} could not be verified.", action):
+                if normalized(self.value(self.control(label), label)) == normalized(desired):
+                    return
+        raise BookingProblem(f"Bookker did not show the requested {label.lower()} as selected.", action)
 
     def open(self, building, floor, vehicle=None):
-        self.navigation("Home").click()
-        self.settled()
-        self.check_session()
-        self.page.get_by_role("button", name=re.compile(r"\bAdd parking booking\b", re.I)).click()
-        self.label("Parking space booking").wait_for()
-        if self.label("Type").count():
-            self.location("Type", "Parking", select=False)
+        with self.parking_step("The Bookker Home navigation link could not be opened.",
+                               "Open Home from Bookker's sidebar and check that it loads."):
+            self.navigation("Home").click(timeout=10_000)
+            self.settled()
+            self.check_session()
+        with self.parking_step("The Add a Parking booking button on Home could not be opened.",
+                               "Check that the Parking card on Bookker Home has an enabled add button."):
+            visible(self.page.get_by_role(
+                "button", name=re.compile(r"\bAdd (?:a )?parking booking\b", re.I)
+            )).click(timeout=10_000)
+        with self.parking_step("Bookker did not display the Parking space booking form.",
+                               "Open the Parking card on Home and check that the booking form loads."):
+            self.label("Parking space booking").wait_for(timeout=10_000)
+        with self.parking_step("Bookker's parking Type control could not be read.",
+                               "Check the Type dropdown in the Bookker parking form."):
+            if self.label("Type").count():
+                self.location("Type", "Parking", select=False)
         self.location("Building", building, select=True)
         self.location("Floor", floor, select=True)
         return self.selected_vehicle(vehicle)
@@ -360,12 +406,13 @@ class ParkingForm:
                                  "Clear repeat dates in the normal Bookker form.")
 
     def selected_vehicle(self, vehicle):
-        selected = self.value(self.control("Vehicle"), "Vehicle")
+        action = "Select the intended vehicle in the normal Bookker form."
+        with self.parking_step("Bookker's parking Vehicle control could not be read.", action):
+            selected = self.value(self.control("Vehicle"), "Vehicle")
         if (not selected or re.match(r"^(?:[-–—]+$|select\b|choose\b|add\b|no vehicle\b)",
                                      selected, re.I)
                 or (vehicle is not None and normalized(selected) != normalized(vehicle))):
-            raise BookingProblem("Bookker did not show the same selected account vehicle.",
-                                 "Select the intended vehicle in the normal Bookker form.")
+            raise BookingProblem("Bookker did not show the same selected account vehicle.", action)
         return selected
 
     def next_date(self, earliest):
@@ -687,34 +734,65 @@ class ParkingForm:
         result = []
         seen = set()
         while True:
-            # Some views nest a card inside a list item. Read only the outer row.
-            cards = rows.evaluate_all("""(rows, bookingRows) => rows
-                .filter(row => !rows.some(other => row !== other && other.contains(row)))
-                .map(row => [row.innerText.trim(),
-                    row.matches(bookingRows) || row.querySelector(bookingRows) !== null])""", BOOKING_ROWS)
+            cards = rows.evaluate_all(r"""(rows, bookingRows) => {
+                const explicit = rows.filter(row => row.matches(bookingRows));
+                // Generic cards inside an explicit row are part of that row.
+                const candidates = rows.filter(row => row.matches(bookingRows) ||
+                    !explicit.some(parent => parent.contains(row)));
+                const children = new Map(candidates.map(row => [row, []]));
+                for (const row of candidates) {
+                    let parent = row.parentElement;
+                    while (parent && !children.has(parent)) parent = parent.parentElement;
+                    if (parent) children.get(parent).push(row);
+                }
+                const flat = text => text.trim().replace(/\s+/g, ' ');
+                return candidates.map(row => {
+                    const text = row.innerText.trim();
+                    const nested = children.get(row);
+                    if (!nested.length) {
+                        return [text, row.matches(bookingRows) ? 'row' : 'card'];
+                    }
+                    // Keep nested rows separate and check that the outer
+                    // card contains only layout text outside them.
+                    let remainder = flat(text);
+                    const fragments = [];
+                    for (const child of nested) {
+                        const childText = flat(child.innerText);
+                        if (!childText) continue;
+                        const start = remainder.indexOf(childText);
+                        if (start < 0) return [null, 'layout'];
+                        fragments.push(remainder.slice(0, start));
+                        remainder = remainder.slice(start + childText.length);
+                    }
+                    return [fragments.concat(remainder).join(' ').trim(), 'layout'];
+                });
+            }""", BOOKING_ROWS)
             empty_text = normalized(empty.inner_text()) if empty.count() else ""
             layout = period_layout
             if empty_text:
                 marker = re.escape(empty_text)
                 layout = rf"(?:{layout}|{layout}\s*{marker}|{marker}\s*{layout})"
-            # A generic card can wrap the filter and empty marker. Ignore it
-            # only when every visible word belongs to those controls.
-            texts = [text for text, explicit in cards
-                     if text and (explicit or not re.fullmatch(layout, normalized(text)))]
+            if any(kind == "layout" and (text is None or not re.fullmatch(layout, normalized(text)))
+                   for text, kind in cards):
+                raise BookingProblem("Bookker did not expose separate reservation rows.",
+                                     "Check the reservation rows in Bookings for the selected period.")
+            texts = [text for text, kind in cards if kind == "row" or (
+                kind == "card" and text and not re.fullmatch(layout, normalized(text))
+            )]
             if empty_text and texts:
                 raise BookingProblem("Bookker showed row content alongside its Bookings empty state.",
                                      "Check which reservations are shown for the selected period in Bookker.")
-            if not texts and not empty_text:
+            if (not texts and not empty_text) or any(not text for text in texts):
                 raise BookingProblem("Bookker did not show a readable Bookings list or empty state.",
                                      "Check the Bookings list for the selected period in Bookker.")
             snapshot = tuple(texts)
             if snapshot in seen:
                 raise BookingProblem("Bookker's Bookings list did not advance to another page.")
             seen.add(snapshot)
-            records = [text for text in texts if not any(
-                INACTIVE.fullmatch(part) for part in booking_statuses(text)
-            )]
-            result.extend(records)
+            for text in texts:
+                statuses = booking_statuses(text)
+                if not statuses or not all(INACTIVE.fullmatch(status) for status in statuses):
+                    result.append(text)
             following = visible(view.get_by_role(
                 "button", name=re.compile(r"^(?:Next page|Página siguiente)$", re.I)
             )).first
@@ -813,7 +891,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
         earliest = max(from_date or FIRST_DAY, FIRST_DAY, datetime.now(ZoneInfo(MADRID)).date())
         vehicle = None
         while True:
-            phase = "verify Home → Parking and its form"
+            phase = "open the parking form to check the next offered date"
             vehicle = form.open(building, floor, vehicle)
             phase = "read the local date from Bookker's offered calendar"
             day = form.next_date(earliest)
@@ -825,8 +903,9 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             records = form.bookings(client.base_url, day, reload=False)
             if day in parking_dates(records, form):
                 continue
-            phase = "restore the candidate date after checking Bookings"
+            phase = "reopen the parking form after checking Bookings"
             form.open(building, floor, vehicle)
+            phase = "restore the candidate date after checking Bookings"
             if form.next_date(day) != day:
                 raise BookingProblem("Bookker stopped offering the candidate date after the Bookings check.",
                                      "Check the offered date in the Bookker parking form before rerunning.")
