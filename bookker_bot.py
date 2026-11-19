@@ -2,12 +2,14 @@
 from __future__ import annotations
 import os, re, json, time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Callable
-from dotenv import load_dotenv
-from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-load_dotenv()
+from parking_booking import book_parking
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser, BrowserContext, Page
 
 @dataclass
 class Spot:
@@ -75,7 +77,10 @@ class BookkerClient:
 
     # ---------- lifecycle ----------
 
-    def _launch(self, storage_state: Optional[str] = None, force_headful: bool = False):
+    def _launch(self, storage_state: Optional[str] = None, force_headful: bool = False,
+                timezone_id: Optional[str] = None):
+        from playwright.sync_api import sync_playwright
+
         self._pw = sync_playwright().start()
         # Use Edge (Chromium) via channel to avoid downloading bundled Chromium
         self.browser = self._pw.chromium.launch(
@@ -83,9 +88,7 @@ class BookkerClient:
             headless=(self.headless and not force_headful),
             slow_mo=self.slow_mo_ms,
         )
-        self.context = self.browser.new_context(
-            storage_state=storage_state if storage_state and Path(storage_state).exists() else None
-        )
+        self.context = self.browser.new_context(storage_state=storage_state, timezone_id=timezone_id)
         self.page = self.context.new_page()
 
     def close(self):
@@ -139,15 +142,15 @@ class BookkerClient:
         print(f"[bookker] Saved auth to {self.auth_state_path.resolve()}")
         self.close()
 
-    def open_with_session(self):
+    def open_with_session(self, *, timezone_id: Optional[str] = None):
         """
         Opens Edge reusing stored session (no 2FA while valid).
         """
         if not self.auth_state_path.exists():
             raise FileNotFoundError(f"Auth state not found: {self.auth_state_path}. Run save_session() first.")
-        self._launch(storage_state=str(self.auth_state_path))
+        self._launch(storage_state=str(self.auth_state_path), timezone_id=timezone_id)
         assert self.page
-        self.page.goto(self.base_url)
+        self.page.goto(self.base_url, wait_until="domcontentloaded")
         self.page.wait_for_load_state("networkidle", timeout=15_000)
 
     # ---------- availability capture ----------
@@ -166,8 +169,7 @@ class BookkerClient:
             if isinstance(node, list) and (not node or isinstance(node[0], dict)): return node  # type: ignore
         return None
 
-    def _attach_capture(self, captures_dir: Path,
-                        on_reservation: Optional[Callable[[Dict[str, Any], str], None]] = None):
+    def _attach_capture(self, captures_dir: Path):
         captures_dir.mkdir(parents=True, exist_ok=True)
         latest_spots: List[Spot] = []
 
@@ -189,10 +191,6 @@ class BookkerClient:
                 print(f"[capture] {url} -> {fp}")
             except Exception:
                 pass
-
-            if on_reservation and resp.request and resp.request.method.upper() == "POST" and "reserv" in url.lower():
-                try: on_reservation(data, url)
-                except Exception: pass
 
             arr = self._maybe_list(data)
             if arr:
@@ -257,48 +255,17 @@ class BookkerClient:
         spot_name: Optional[str] = None,
         spot_id: Optional[str] = None,
         confirm_click: bool = False,
-        wait_ms: int = 2000,
+        *,
+        building: Optional[str] = None,
+        floor: Optional[str] = None,
+        from_date: Optional[date] = None,
+        whole_day: bool = False,
+        submission_state: Optional[Path] = None,
+        result_file: Optional[Path] = None,
     ) -> Dict[str, Any]:
-        """
-        UI-based booking attempt.
-        - If confirm_click=False -> dry run (does not click final Book/Reserve).
-        - Provide either spot_name or spot_id; name match is often easiest.
-        Returns: {"attempted": bool, "confirmed": bool, "response": {...} or {} }
-        """
-        assert self.page
-        reservation_payload: Dict[str, Any] = {}
-
-        def on_resv(data, url): reservation_payload.update({"url": url, "data": data})
-        _ = self._attach_capture(Path("captures"), on_reservation=on_resv)
-
-        attempted = False
-        try:
-            # Open list view if present
-            try:
-                fab = self.page.get_by_role("button", name=re.compile(r"list|lista|view|menu", re.I)).first()
-                if fab and fab.is_visible(): fab.click()
-            except Exception: pass
-
-            # Pick the row
-            locator = None
-            if spot_name:
-                locator = self.page.get_by_role("row", name=re.compile(re.escape(spot_name), re.I)).first()
-            elif spot_id:
-                locator = self.page.get_by_role("row", name=re.compile(re.escape(spot_id), re.I)).first()
-            if locator and locator.is_visible():
-                locator.click(); attempted = True
-            else:
-                any_avail = self.page.get_by_role("row", name=re.compile(r"available|libre|disponible", re.I)).first()
-                if any_avail and any_avail.is_visible():
-                    any_avail.click(); attempted = True
-
-            # Final confirmation
-            if attempted and confirm_click:
-                with self.page.expect_response(lambda r: ("reserv" in r.url.lower()) and r.ok, timeout=10_000):
-                    self.page.get_by_role("button", name=re.compile(r"book|reserve|confirm|reservar|confirmar", re.I)).click()
-                self.page.wait_for_timeout(wait_ms)
-
-        except Exception as e:
-            return {"attempted": attempted, "confirmed": False, "error": str(e), "response": reservation_payload}
-
-        return {"attempted": attempted, "confirmed": bool(reservation_payload), "response": reservation_payload}
+        return book_parking(
+            self, building=building, floor=floor, from_date=from_date,
+            whole_day=whole_day, spot_name=spot_name, spot_id=spot_id,
+            confirm_click=confirm_click, submission_state=submission_state,
+            result_file=result_file,
+        )
