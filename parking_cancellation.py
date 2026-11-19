@@ -6,17 +6,12 @@ from dataclasses import asdict, dataclass
 from datetime import date
 
 from parking_booking import (
-    LOCATION_FIELD, MADRID, REFERENCE_FIELD, SIGN_IN, SPACE_CODE, SPACE_FIELD, STATUS_FIELD,
-    BookingProblem, ParkingForm, booking_references, booking_space, booking_statuses, card_locations,
-    dates, field_values, intervals, normalized, outcome, shows, shows_all_day, shows_location, visible,
-    write_json,
+    LOCATION_FIELD, LOCATION_SEPARATOR, MADRID, PARKING_TYPE, SIGN_IN, SPACE_CODE, SPACE_FIELD,
+    BookingProblem, ParkingForm, booking_references, card_locations, dates, displayed_spaces,
+    field_values, intervals, normalized, outcome, shows_location, visible, write_json,
 )
 
 CANCEL_CHECK = "Check the selected reservation in Bookker Bookings."
-PARKING_TYPE = re.compile(r"\b(?:parking|aparcamiento|estacionamiento|plaza)\b", re.I)
-DETAIL_FIELDS = (rf"{SPACE_FIELD}|{LOCATION_FIELD}|{REFERENCE_FIELD}|{STATUS_FIELD}|"
-                 r"Date|Fecha|Time|Schedule|Horario|Type|Resource type|Tipo|Vehicle|Vehículo")
-DETAIL_HEADING = re.compile(r"(?:Booking|Reservation) details|Detalles de la reserva|close|back", re.I)
 MENU_TRIGGER = re.compile(r"^(?:more(?: actions| options|_vert|_horiz)?|"
                           r"booking actions|options|acciones|opciones|más opciones)$", re.I)
 DELETE = re.compile(r"^(?:(?:delete|eliminar)\s+)?(?:Delete|Eliminar)(?: (?:this )?(?:booking|reservation|"
@@ -47,26 +42,13 @@ def booking_location(text):
         return buildings.pop(), floors.pop()
     combined = list(field_values(text, r"Building|Edificio|Location|Ubicación", split_inline=False))
     combined.extend(card_locations(text))
-    combined.extend(line for line in text.splitlines() if PARKING_TYPE.search(line))
     for label in combined:
-        names = re.split(r"\s*[,/|·]\s*", label.strip().rstrip(","))
+        names = re.split(LOCATION_SEPARATOR, label.strip().rstrip(","))
         if len(names) == 2 and all(names) and shows_location(text, *names):
+            if PARKING_TYPE.search(names[0]) and not PARKING_TYPE.search(names[1]):
+                names.reverse()
             return tuple(names)
     return None
-
-
-def linked_space_title(text, day_first, location):
-    # The details panel can render the resource title on its own above the booking fields.
-    metadata = {normalized(value) for value in field_values(text, DETAIL_FIELDS, split_inline=False)}
-    metadata.update(map(normalized, location or ()))
-    for line in text.splitlines():
-        title = line.strip()
-        if (re.fullmatch(SPACE_CODE, title) and normalized(title) not in metadata
-                and not re.fullmatch(DETAIL_FIELDS, title, re.I) and not DETAIL_HEADING.fullmatch(title)
-                and not dates(title, day_first) and not booking_statuses(title)
-                and not shows_all_day(title) and not booking_location(title) and not card_locations(title)):
-            return title
-    return ""
 
 
 def find_reservation(records, target, form, base_url, day):
@@ -103,19 +85,14 @@ def reservation_details(record, target, requested_location, form, base_url, day)
         return booking_location(text)
 
     location = location_in(record)
-    def space_in(text):
-        if target.space and shows(text, SPACE_FIELD, target.space):
-            return target.space
-        return booking_space(text)
-
-    space = space_in(record)
+    card_spaces = displayed_spaces(record, form.day_first, location or requested_location or ())
     days = dates(record, form.day_first)
-    references = booking_references(record)
+    card_references = booking_references(record)
+    references = card_references.copy()
     hours = intervals(record)
     linked = ""
-    linked_title = ""
-    titles = {}
-    if not (location and space and days) or (target.reference and not references):
+    linked_spaces = {}
+    if not (location and card_spaces and days) or (target.reference and not references):
         row = form.booking_row(base_url, day, record)
         names = visible(row.locator(
             ".resource-name, .booking-name, [data-testid=booking-space], a .strong, [role=link] .strong"
@@ -123,9 +100,9 @@ def reservation_details(record, target, requested_location, form, base_url, day)
         for name in names.all_inner_texts():
             name = name.strip()
             if re.fullmatch(SPACE_CODE, name):
-                titles[normalized(name)] = name
-        title = next(iter(titles.values())) if len(titles) == 1 else ""
-        linked = form.booking_details(base_url, day, record, title or space)
+                card_spaces.setdefault(normalized(name), name)
+        title = next(iter(card_spaces.values())) if len(card_spaces) == 1 else ""
+        linked = form.booking_details(base_url, day, record, title)
         if not linked.strip():
             raise BookingProblem("Bookker did not display readable details for the matching reservation.",
                                  CANCEL_CHECK)
@@ -138,20 +115,22 @@ def reservation_details(record, target, requested_location, form, base_url, day)
         if linked_location and location and not shows_location(linked, *location):
             raise BookingProblem("The linked booking details showed a different location.", CANCEL_CHECK)
         location = location or linked_location
-        linked_title = linked_space_title(linked, form.day_first, location)
-        space = space or title or space_in(linked) or linked_title
+        linked_spaces = displayed_spaces(linked, form.day_first, location or ())
         days |= dates(linked, form.day_first)
         hours = hours or intervals(linked)
 
-    # The linked panel can omit fields already shown on the card.
-    if ((titles and titles.keys() != {normalized(space)})
-            or (linked_title and normalized(linked_title) != normalized(space))
-            or any(list(field_values(text, SPACE_FIELD)) and not shows(text, SPACE_FIELD, space)
-                   for text in (record, linked))):
+    spaces = linked_spaces | card_spaces
+    if len(spaces) > 1:
         raise BookingProblem("A possible matching Bookings row showed conflicting spaces.", CANCEL_CHECK)
+    if target.reference and not card_references and (
+        not card_spaces or not (linked_spaces or list(field_values(record, SPACE_FIELD)))
+    ):
+        raise BookingProblem("The linked reference could not be tied to a verified space on the Bookings row.",
+                             CANCEL_CHECK)
+    space = next(iter(spaces.values()), "")
     if target.space and space and normalized(target.space) != normalized(space):
         return None
-    if not location or not space:
+    if not location or not re.fullmatch(SPACE_CODE, space):
         raise BookingProblem("Bookker did not show the parking space and location for the selected reservation.",
                              CANCEL_CHECK)
     building, floor = location
@@ -222,14 +201,14 @@ def confirm_cancellation(dialogs, details, *, day_first, needs_occurrence_choice
         raise BookingProblem("Bookker showed multiple cancellation dialogs.", CANCEL_CHECK)
     text = dialogs.inner_text(timeout=1000)
     shown_days = dates(text, day_first)
-    shown_spaces = {normalized(value) for value in field_values(text, SPACE_FIELD)}
     shown_references = booking_references(text)
     shown_location = list(field_values(text, LOCATION_FIELD)) or card_locations(text)
     expected_location = details["building"], details["floor"]
+    shown_spaces = displayed_spaces(text, day_first, expected_location)
     shown_hours = intervals(text)
     known_hours = {tuple(span) for span in details.get("displayed_intervals", [])}
     if ((shown_days and shown_days != {date.fromisoformat(details["date"])})
-            or (shown_spaces and shown_spaces != {normalized(details["space"])})
+            or (shown_spaces and shown_spaces.keys() != {normalized(details["space"])})
             or (shown_references and shown_references != {details.get("confirmation_reference")})
             or (shown_location and not shows_location(text, *expected_location))
             or (shown_hours and shown_hours != known_hours)):
@@ -284,15 +263,14 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
         form = ParkingForm(client.page)
         base_url = client.base_url
         records = form.bookings(base_url, day, reload=True)
-        selected = find_reservation(records, target, form, base_url, day)
-        if attempted and selected is None and target.reference:
-            selected = find_reservation(records, stored_location(details), form, base_url, day)
-        if selected is None:
-            if attempted:
-                return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
-            return result("absent", "No parking reservation matched in reloaded Bookings.")
         if attempted:
-            return result("unknown", "A cancellation intent already exists and the selector still matches a Bookings row.")
+            if reservation_remaining(records, details, form, base_url, day):
+                return result("unknown", "A cancellation intent already exists and the reservation is still present.")
+            return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
+
+        selected = find_reservation(records, target, form, base_url, day)
+        if selected is None:
+            return result("absent", "No parking reservation matched in reloaded Bookings.")
 
         row_text, details, recurring = selected
         if not confirm:
@@ -320,10 +298,7 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
             action_error = "The Bookker cancellation action could not be verified."
         day = date.fromisoformat(details["date"])
         records = form.bookings(base_url, day, reload=True)
-        remaining = find_reservation(records, target, form, base_url, day)
-        if remaining is None and target.reference:
-            remaining = find_reservation(records, stored_location(details), form, base_url, day)
-        if remaining is None:
+        if not reservation_remaining(records, details, form, base_url, day):
             return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
         return result("unknown", action_error or "The selected reservation is still present in reloaded Bookings.")
     except BookingProblem as error:
@@ -338,5 +313,11 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
         return result("unknown" if attempted else "blocked", "The Bookker Bookings operation could not be verified.")
 
 
-def stored_location(details):
-    return CancelTarget(details["date"], details["building"], details["floor"], details["space"], None)
+def reservation_remaining(records, details, form, base_url, day):
+    reference = details.get("confirmation_reference")
+    if reference:
+        by_reference = CancelTarget(details["date"], None, None, None, reference)
+        if find_reservation(records, by_reference, form, base_url, day):
+            return True
+    by_location = CancelTarget(details["date"], details["building"], details["floor"], details["space"], None)
+    return find_reservation(records, by_location, form, base_url, day) is not None

@@ -56,8 +56,10 @@ The CLI reads linked details when a possible match omits identifying fields.
 Recurring rows require an explicit single-occurrence action or choice.
 
 Reuse that intent path after an interruption. A rerun checks for removal in a
-reloaded Bookings period that covers the saved date. The result stays uncertain
-if that coverage cannot be verified or the selector still matches.
+reloaded Bookings period that covers the saved date. Verification uses the saved
+reference when available and checks the original location and space if the
+reference is absent. The result stays uncertain if the period cannot be verified
+or either lookup still finds the reservation.
 
 ## Offline verification
 

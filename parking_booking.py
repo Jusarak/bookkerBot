@@ -125,11 +125,33 @@ STATUS_FIELD = r"(?:Booking )?Status|Estado(?: de la reserva)?"
 SPACE_FIELD = r"Parking space|Space|Plaza|Resource|Recurso"
 LOCATION_FIELD = r"Building|Edificio|Floor|Planta|Location|Ubicación"
 LOCATION_ICON = re.compile(r"^(?:location_on\s*|place(?:\s+|$))", re.I)
+LOCATION_SEPARATOR = r"\s*[,/|·•]\s*"
+PARKING_TYPE = re.compile(r"\b(?:parking|aparcamiento|estacionamiento|plaza)\b", re.I)
 REFERENCE_FIELD = (r"Reference|Confirmation(?: (?:reference|code|number|ID))?|"
                    r"Booking (?:reference|number|ID)|Reservation (?:reference|number|ID)|"
                    r"Referencia(?: de (?:reserva|confirmación))?")
 REFERENCE_CODE = r"[\w#-]{1,80}"
 SPACE_CODE = r"[\w][\w .#/-]{0,47}"
+BOOKING_DETAIL_FIELD = re.compile(
+    rf"(?:{SPACE_FIELD}|{LOCATION_FIELD}|{REFERENCE_FIELD}|{STATUS_FIELD}|Date|Fecha|Time|Schedule|"
+    r"Horario|Type|Resource type|Tipo|Vehicle|Vehículo|Repeat|Repetición)(?:\s*:\s*(.*))?", re.I,
+)
+BOOKING_DETAILS_ACTION = re.compile(
+    r"^(?:(?:(?:View|Show|Open) )?(?:(?:booking|reservation) )?"
+    r"(?:details|details of (?:booking|reservation))|"
+    r"(?:View|Show|Open) (?:booking|reservation)|(?:Ver )?detalles(?: de la reserva)?)$", re.I,
+)
+BOOKING_CONTROL = re.compile(
+    r"Detalles de la reserva|(?:View|Show|Open) map|Ver mapa|"
+    r"Booking|Reservation|Reserva|My bookings|Mis reservas|Parking|Aparcamiento|"
+    r"Close|Back|Cerrar|Volver|Confirm(?: deletion)?|Confirmar|Yes|Sí|No|Cancel|Cancelar|"
+    r"(?:Delete|Eliminar)(?: (?:this )?(?:booking|reservation|reserva))?|"
+    r"Recurring series|Recurring|No repeat|Sin repetición|"
+    r"(?:Delete )?(?:Only this |This |All )(?:bookings?|occurrences?|reservations?)(?: only)?|Single occurrence|"
+    r"(?:Solo esta |Esta |Todas las )(?:reservas?|ocurrencias?)(?: solamente)?|"
+    r"(?:More(?: actions| options|_vert|_horiz)?|booking actions|options|acciones|opciones|más opciones)|"
+    r"event(?:_available|_busy)?|calendar_today|info(?:_outline)?|chevron_right|arrow_back", re.I,
+)
 DATE_TEXT = re.compile(
     r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}|"
     r"[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+(?:de\s+)?"
@@ -379,6 +401,13 @@ def shows(text, labels, value):
     return any(normalized(part) == normalized(value) for part in fields(text))
 
 
+def is_standalone_parking_location(line):
+    names = re.split(LOCATION_SEPARATOR, line.strip().rstrip(","))
+    # The bare layout places a parking floor and building on the same line.
+    return (len(names) == 2 and all(name and ":" not in name for name in names)
+            and any(PARKING_TYPE.search(name) for name in names))
+
+
 def card_locations(text):
     locations = []
     lines = text.splitlines()
@@ -404,6 +433,8 @@ def card_locations(text):
                 locations.append(", ".join(parts[:2]))
             elif icon:
                 locations.append(location)
+        elif is_standalone_parking_location(line):
+            locations.append(line)
     return locations
 
 
@@ -436,6 +467,28 @@ def shows_location(text, building, floor):
 def booking_space(text):
     names = set(field_values(text, SPACE_FIELD))
     return next(iter(names)) if len(names) == 1 and re.fullmatch(SPACE_CODE, next(iter(names))) else ""
+
+
+def displayed_spaces(text, day_first, location=()):
+    """Collect labeled spaces and standalone titles from rendered booking text."""
+    names = {normalized(value): value for value in field_values(text, SPACE_FIELD)}
+    lines = iter(part for line in text.splitlines()
+                 for part in ([line.strip()] if is_standalone_parking_location(line) else fields(line)))
+    location_names = set(map(normalized, location))
+    for line in lines:
+        label = BOOKING_DETAIL_FIELD.fullmatch(line)
+        if label or LOCATION_ICON.fullmatch(line):
+            # Values on their own line belong to the preceding field or icon.
+            if not label or not label[1]:
+                next(lines, None)
+            continue
+        if (re.fullmatch(SPACE_CODE, line) and normalized(line) not in location_names
+                and not BOOKING_CONTROL.fullmatch(line) and not BOOKING_DETAILS_ACTION.fullmatch(line)
+                and not dates(line, day_first)
+                and not booking_statuses(line) and not shows_all_day(line) and not is_standalone_parking_location(line)
+                and not (location and shows_location(line, *location))):
+            names.setdefault(normalized(line), line)
+    return names
 
 
 def booking_references(text):
@@ -1307,14 +1360,10 @@ class ParkingForm:
 
     def booking_details(self, base_url, day, record, space):
         row = self.booking_row(base_url, day, record)
-        details_name = re.compile(r"^(?:(?:View|Show|Open) )?(?:(?:booking|reservation) )?"
-                                  r"(?:details|details of (?:booking|reservation))$|"
-                                  r"^(?:View|Show|Open) (?:booking|reservation)$|"
-                                  r"^(?:Ver )?detalles(?: de la reserva)?$", re.I)
         detail_href = ('a:is([href*="/booking/"], [href*="/bookings/"], [href*="/reservation/"])'
                        ':not([href*="/map"], [href*="/delete"])')
-        action = row.get_by_role("link", name=details_name).or_(
-            row.get_by_role("button", name=details_name)
+        action = row.get_by_role("link", name=BOOKING_DETAILS_ACTION).or_(
+            row.get_by_role("button", name=BOOKING_DETAILS_ACTION)
         ).or_(row.locator(detail_href)).or_(
             row.and_(self.page.locator(detail_href))
         )
@@ -1404,7 +1453,8 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
     pending = any(value.endswith(PENDING_MESSAGE) for value in (observation or {}).values())
 
     def matching_space(record):
-        return shows(record, SPACE_FIELD, selection.space)
+        spaces = displayed_spaces(record, form.day_first, (selection.building, selection.floor))
+        return spaces.keys() == {normalized(selection.space)}
 
     def matching_location(record):
         return shows_location(record, selection.building, selection.floor)
@@ -1422,8 +1472,7 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
             return True
         if base_url is None:
             return False
-        has_location = (list(field_values(record, LOCATION_FIELD)) or card_locations(record)
-                        or re.search(r"[,/·]\s*parking\s+\w", record, re.I))
+        has_location = list(field_values(record, LOCATION_FIELD)) or card_locations(record)
         return not has_location or matching_location(record)
 
     matches = [record for record in records if matches(record)]
