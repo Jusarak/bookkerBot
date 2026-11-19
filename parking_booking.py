@@ -172,6 +172,10 @@ class BookingProblem(Exception):
         self.next_action = next_action
 
 
+class MissingBookingDetailsLink(BookingProblem):
+    """A verified Bookings row has no visible details action."""
+
+
 def outcome(status, reason, next_action, *, observation=None):
     result = {"outcome": status, "reason": reason, "next_action": next_action}
     if observation:
@@ -1390,7 +1394,10 @@ class ParkingForm:
             if space:
                 titles = titles.and_(row.get_by_text(space, exact=True))
             action = titles
-        if action.count() != 1 or not action.is_enabled(timeout=1000):
+        count = action.count()
+        if not count:
+            raise MissingBookingDetailsLink("The matching Bookings row did not expose one booking details link.")
+        if count != 1 or not action.is_enabled(timeout=1000):
             raise BookingProblem("The matching Bookings row did not expose one booking details link.")
         if row.inner_text(timeout=1000).strip() != record:
             raise BookingProblem("The matching Bookings row changed before its details could be opened.")

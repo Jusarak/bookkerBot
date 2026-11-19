@@ -7,7 +7,7 @@ from datetime import date
 
 from parking_booking import (
     LOCATION_FIELD, MADRID, PARKING_TYPE, SIGN_IN, SPACE_CODE, SPACE_FIELD,
-    BookingProblem, ParkingForm, booking_references, card_locations, dates, displayed_spaces,
+    BookingProblem, MissingBookingDetailsLink, ParkingForm, booking_references, card_locations, dates, displayed_spaces,
     field_values, intervals, location_pair_names, normalized, outcome, shift_span, shows_location, visible, write_json,
 )
 
@@ -95,7 +95,8 @@ def reservation_details(record, target, requested_location, form, base_url, day)
     hours = intervals(record)
     linked = ""
     linked_spaces = {}
-    if not (location and card_spaces and days) or (target.reference and not references):
+    needs_details = not (location and card_spaces and days) or (target.reference is not None and not references)
+    if needs_details:
         row = form.booking_row(base_url, day, record)
         names = visible(row.locator(
             ".resource-name, .booking-name, [data-testid=booking-space], a .strong, [role=link] .strong"
@@ -104,12 +105,18 @@ def reservation_details(record, target, requested_location, form, base_url, day)
             name = name.strip()
             if re.fullmatch(SPACE_CODE, name):
                 card_spaces.setdefault(normalized(name), name)
+    if needs_details or (target.space and not references and card_spaces.keys() == {normalized(target.space)}):
         title = next(iter(card_spaces.values())) if len(card_spaces) == 1 else ""
-        linked = form.booking_details(base_url, day, record, title)
-        if not linked.strip():
-            raise BookingProblem("Bookker did not display readable details for the matching reservation.",
-                                 CANCEL_CHECK)
-        references |= booking_references(linked)
+        try:
+            linked = form.booking_details(base_url, day, record, title)
+        except MissingBookingDetailsLink:
+            if needs_details:
+                raise
+        else:
+            if not linked.strip():
+                raise BookingProblem("Bookker did not display readable details for the matching reservation.",
+                                     CANCEL_CHECK)
+            references |= booking_references(linked)
 
     if target.reference and target.reference not in references:
         return None

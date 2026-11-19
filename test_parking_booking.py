@@ -17,8 +17,8 @@ import run_bookker
 from parking_booking import (
     BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, FINAL_ATTEMPT, NO_BOOKINGS, RETRY_ATTEMPT,
     RETRY_FINAL_ATTEMPT, RETRY_PERMISSION, SUPERFICIE_SATURDAY_SHIFTS, TORRES_SHIFTS, BookingProblem,
-    ParkingForm, Selection, SpaceChoice, dates, intervals, parking_dates, period_covers, read_intent, verify_booking,
-    write_json,
+    MissingBookingDetailsLink, ParkingForm, Selection, SpaceChoice, dates, intervals, parking_dates, period_covers,
+    read_intent, verify_booking, write_json,
 )
 
 
@@ -210,7 +210,7 @@ class CancellationFixture:
     def booking_details(self, base_url, day, record, space):
         self.detail_reads.append(record)
         if record not in self.linked:
-            raise BookingProblem("The matching Bookings row did not expose one booking details link.")
+            raise MissingBookingDetailsLink("The matching Bookings row did not expose one booking details link.")
         return self.linked[record]
 
     def settled(self):
@@ -555,6 +555,30 @@ class CancellationCommandTests(unittest.TestCase):
         self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
         self.assertEqual(self.form.records, [card, self.form.neighbor])
         self.form.trigger.click.assert_called_once()
+        self.form.delete.click.assert_called_once()
+
+    def test_location_cancellation_saves_linked_reference_before_delete(self):
+        details = self.form.target
+        card = details.replace("\nConfirmation reference: OFFLINE-123", "")
+        changed = card.replace("November 26", "November 27")
+        self.form.target = self.form.records[0] = card
+        self.form.row.inner_text.return_value = card
+        self.form.linked[card] = details
+        self.form.linked[changed] = details.replace("November 26", "November 27")
+
+        def change_date(**kwargs):
+            saved = json.loads(self.state.read_text())["reservation"]
+            self.assertEqual(saved.get("confirmation_reference"), "OFFLINE-123")
+            self.form.records[0] = changed
+
+        self.form.delete.click.side_effect = change_date
+        args = (*self.selector, "--confirm", "--submission-state", str(self.state))
+        for _ in range(2):
+            result = self.run_command(*args)
+            self.assertEqual(result["outcome"], "unknown")
+            self.assertIn("different date", result["reason"])
+        self.assertEqual(self.form.detail_reads, [card, changed, changed])
+        self.assertEqual(self.form.records, [changed, self.form.neighbor])
         self.form.delete.click.assert_called_once()
 
     def test_wrong_ambiguous_and_absent_selectors_do_not_open_a_menu(self):

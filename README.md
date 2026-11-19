@@ -53,13 +53,16 @@ python3 run_bookker.py cancel --on-date 2026-11-26 --building NEWTON \
 ```
 
 The CLI reads linked details when a possible match omits identifying fields.
-Recurring rows require an explicit single-occurrence action or choice.
+For a location match with no reference on the card, it also checks any details
+link for a reference to save in the intent. Recurring rows require an explicit
+single-occurrence action or choice.
 
 Reuse that intent path after an interruption. A rerun checks for removal in a
 reloaded Bookings period that covers the saved date. Verification uses the saved
 reference when available and checks the original location and space if the
-reference is absent. The result stays uncertain if the period cannot be verified
-or either lookup still finds the reservation.
+reference is absent. The result stays uncertain if the period cannot be verified,
+either lookup still finds the reservation, or the saved reference appears with a
+different date.
 
 ## Offline verification
 
