@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import run_bookker
 from parking_booking import (
     BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, NO_BOOKINGS, RETRY_ATTEMPT,
-    RETRY_FINAL_ATTEMPT, RETRY_PERMISSION, TORRES_SHIFTS, BookingProblem,
+    RETRY_FINAL_ATTEMPT, RETRY_PERMISSION, SUPERFICIE_SATURDAY_SHIFTS, TORRES_SHIFTS, BookingProblem,
     ParkingForm, Selection, SpaceChoice, dates, intervals, parking_dates, period_covers, read_intent, verify_booking,
     write_json,
 )
@@ -45,23 +45,27 @@ class OfflineForm:
         self.exact_dates = []
         self.events = []
         self.after_book = ("Bookker showed no recognized response within the wait period.", None)
+        self.floor = "Parking Torres Quevedo"
+        self.space = "PTQ-123"
+        self.span = ("07:00", "23:00")
+        self.details = None
 
     def check_session(self):
         pass
 
-    def bookings(self, base_url, day, *, reload):
+    def bookings(self, base_url, day, *, reload, include_inactive=False):
         self.bookings_reads.append((day.day, reload))
         self.events.append("reload" if reload else "read")
         return self.after_submit if reload else self.existing
 
     def open(self, building, floor, vehicle):
-        assert (building, floor) == ("NEWTON", "Parking Torres Quevedo")
+        assert (building, floor) == ("NEWTON", self.floor)
         assert vehicle in (None, self.vehicle)
         return self.vehicle
 
     def location(self, label, value, *, select):
         assert not select
-        assert (label, value) in (("Building", "NEWTON"), ("Floor", "Parking Torres Quevedo"))
+        assert (label, value) in (("Building", "NEWTON"), ("Floor", self.floor))
 
     def selected_vehicle(self, vehicle):
         assert vehicle == self.vehicle
@@ -82,18 +86,29 @@ class OfflineForm:
     def check_date(self, day):
         assert self.day == day
 
-    def whole_day(self, expected_shifts):
-        assert expected_shifts == (TORRES_SHIFTS if self.day.day == 26 else ())
-        if self.day == date(2026, 11, 21):
+    def whole_day(self, expected_shifts, *, verify_all=False):
+        assert verify_all == (self.floor == "Parking Superficie C")
+        if verify_all:
+            assert expected_shifts == (SUPERFICIE_SATURDAY_SHIFTS if self.day.day == 21 else ())
+        else:
+            assert expected_shifts == (TORRES_SHIFTS if self.day.day == 26 else ())
+        if not verify_all and self.day == date(2026, 11, 21):
             return None  # One displayed shift has ended.
-        return ("07:00", "23:00"), False
+        return self.span, False
 
     def select_space(self, building, floor, span, spot_name, spot_id, *, require_material):
-        assert span == ("07:00", "23:00")
-        assert require_material == (self.day.day == 26)
+        assert span == self.span
+        assert require_material == (self.day.day == 26 or self.floor == "Parking Superficie C")
         if self.day == date(2026, 11, 22):
             return None  # No space is available for the requested interval.
-        return SpaceChoice("PTQ-123", material=require_material)
+        return SpaceChoice(self.space, material=require_material)
+
+    def booking_details(self, base_url, day, record, space):
+        assert record in self.after_submit and space == self.space
+        self.events.append("details")
+        if self.details is None:
+            raise BookingProblem("The matching Bookings row did not expose one booking details link.")
+        return self.details
 
     def review(self, day, span, all_day, building, floor, choice, vehicle):
         assert vehicle == self.vehicle
@@ -132,6 +147,165 @@ Vehicle: private fixture vehicle
 """
 EXACT_ARGS = ("--on-date", "2026-11-26")
 EXACT_MATCH = MATCH.replace("November 23", "November 26")
+
+
+def locator(count=1, text=""):
+    element = Mock(**{"count.return_value": count, "inner_text.return_value": text,
+                      "is_enabled.return_value": True, "get_attribute.return_value": None})
+    element.filter.return_value = element
+    element.or_.return_value = element
+    element.and_.return_value = element
+    return element
+
+
+class CancellationFixture:
+    day_first = False
+
+    def __init__(self):
+        self.target = EXACT_MATCH.strip()
+        self.neighbor = self.target.replace("PTQ-123", "PTQ-124").replace("OFFLINE-123", "OFFLINE-124")
+        self.records = [self.target, self.neighbor]
+        self.reads = []
+        self.page = Mock()
+        self.row = locator(text=self.target)
+        self.trigger = locator()
+        self.trigger.get_attribute.return_value = "row-menu"
+        self.row.get_by_role.return_value = self.trigger
+        self.menu = locator(0)
+        self.menu.get_attribute.return_value = "row-menu"
+        self.dialog = locator(0)
+        self.dialog.wait_for.side_effect = TimeoutError()
+        self.page.get_by_role.side_effect = {"menu": self.menu, "dialog": self.dialog}.__getitem__
+        self.only_this = locator(0)
+        self.radio = locator(0)
+        self.delete = locator()
+        self.final_delete = locator()
+        self.menu.get_by_role.side_effect = lambda role, name=None: self.delete if name else self.only_this
+        self.dialog.get_by_role.side_effect = lambda role, name: (
+            self.radio if role == "radio" else self.final_delete if name.fullmatch("Delete") else self.only_this
+        )
+        self.trigger.click.side_effect = lambda **kwargs: setattr(self.menu.count, "return_value", 1)
+        self.delete.click.side_effect = self.remove
+        self.final_delete.click.side_effect = self.remove
+
+    def bookings(self, base_url, day, *, reload):
+        assert reload
+        self.reads.append(day)
+        return self.records.copy()
+
+    def booking_row(self, base_url, day, record):
+        assert record == self.target
+        return self.row
+
+    def settled(self):
+        pass
+
+    def remove(self, **kwargs):
+        self.records.remove(self.target)
+        self.menu.count.return_value = 0
+
+    def prompt(self, text):
+        def open_dialog(**kwargs):
+            self.menu.count.return_value = 0
+            self.dialog.count.return_value = 1
+            self.dialog.inner_text.return_value = text
+            self.dialog.wait_for.side_effect = None
+        self.delete.click.side_effect = open_dialog
+
+
+class CancellationCommandTests(unittest.TestCase):
+    def setUp(self):
+        work = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(work.cleanup)
+        self.state = Path(work.name) / "cancel.json"
+        self.form = CancellationFixture()
+        self.selector = ("--on-date", "2026-11-26", "--building", "NEWTON",
+                         "--floor", "Parking Torres Quevedo", "--spot-name", "PTQ-123")
+        self.stdout, self.stderr = io.StringIO(), io.StringIO()
+
+    def run_command(self, *args):
+        self.stdout, self.stderr = io.StringIO(), io.StringIO()
+        with (
+            patch.object(sys, "argv", ["run_bookker.py", "cancel", *args]),
+            patch("parking_cancellation.ParkingForm", return_value=self.form),
+            patch.object(run_bookker.BookkerClient, "open_with_session", autospec=True) as launch,
+            contextlib.redirect_stdout(self.stdout),
+            contextlib.redirect_stderr(self.stderr),
+        ):
+            run_bookker.main()
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.kwargs, {"timezone_id": "Europe/Madrid"})
+        self.assertNotIn("private fixture vehicle", self.stdout.getvalue() + self.stderr.getvalue())
+        return json.loads(self.stdout.getvalue())
+
+    def test_preview_and_confirm_single_occurrence_leave_neighbor(self):
+        result = self.run_command(*self.selector)
+        self.assertEqual(result["outcome"], "preview")
+        self.assertEqual(result["confirmation_reference"], "OFFLINE-123")
+        self.form.trigger.click.assert_not_called()
+        self.assertFalse(self.state.exists())
+        self.form.prompt("Delete booking?\nRecurring series\nOnly this occurrence\nDelete")
+        self.form.radio.count.return_value = 1
+        self.form.radio.is_checked.side_effect = [False, True]
+
+        def remove(**kwargs):
+            self.assertEqual(json.loads(self.stderr.getvalue())["space"], "PTQ-123")
+            self.assertEqual(json.loads(self.state.read_text())["reservation"]["space"], "PTQ-123")
+            self.form.remove()
+
+        self.form.final_delete.click.side_effect = remove
+        self.assertEqual(self.run_command(*self.selector, "--confirm", "--submission-state", str(self.state))[
+            "outcome"], "cancelled")
+        self.assertEqual(self.form.records, [self.form.neighbor])
+        self.assertEqual(self.form.reads, [date(2026, 11, 26)] * 3)
+        self.form.radio.check.assert_called_once()
+        self.form.final_delete.click.assert_called_once()
+
+    def test_cancel_by_reference_reconciles_interruption_without_second_delete(self):
+        args = ("--reference", "OFFLINE-123", "--confirm", "--submission-state", str(self.state))
+
+        def interrupt(**kwargs):
+            self.assertTrue(self.state.is_file())
+            self.form.remove()
+            raise KeyboardInterrupt
+
+        self.form.delete.click.side_effect = interrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_command(*args)
+        self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+        self.assertEqual(self.form.records, [self.form.neighbor])
+        self.assertEqual(self.form.reads, [None, date(2026, 11, 26)])
+        self.form.delete.click.assert_called_once()
+
+    def test_wrong_ambiguous_and_absent_selectors_do_not_open_a_menu(self):
+        confirm = ("--confirm", "--submission-state", str(self.state))
+        for selector in (
+            ("--reference", "WRONG-123"),
+            self.selector[:-1] + ("PTQ-999",),
+            self.selector[:5] + ("Parking Superficie C",) + self.selector[6:],
+        ):
+            with self.subTest(selector=selector):
+                self.assertEqual(self.run_command(*selector, *confirm)["outcome"], "absent")
+        self.form.records.append(self.form.target.replace("OFFLINE-123", "OFFLINE-456"))
+        self.assertEqual(self.run_command(*self.selector, *confirm)["outcome"], "blocked")
+        self.form.records = [self.form.neighbor]
+        self.assertEqual(self.run_command(*self.selector, *confirm)["outcome"], "absent")
+        self.assertFalse(self.state.exists())
+        self.form.trigger.click.assert_not_called()
+
+    def test_conflicting_confirmation_and_rerun_never_delete_a_replacement(self):
+        args = (*self.selector, "--confirm", "--submission-state", str(self.state))
+        self.form.prompt("Delete this booking?\nNovember 27, 2026\nSpace: PTQ-124")
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertIn("different reservation", result["reason"])
+        self.assertEqual(self.form.records, [self.form.target, self.form.neighbor])
+        self.form.final_delete.click.assert_not_called()
+
+        self.form.records[0] = self.form.target.replace("OFFLINE-123", "NEW-123")
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.form.delete.click.assert_called_once()
+        self.form.final_delete.click.assert_not_called()
 
 
 class ParkingCommandTests(unittest.TestCase):
@@ -247,6 +421,82 @@ class ParkingCommandTests(unittest.TestCase):
         self.assertIn("different date", result["reason"])
         self.assertEqual(self.form.bookings_reads, [])
         self.assertFalse(self.form.intent.exists())
+
+    def superficie_args(self, day="2026-11-21"):
+        self.form.floor = "Parking Superficie C"
+        self.form.space = "PSC-17"
+        return "--floor", self.form.floor, "--on-date", day
+
+    def test_superficie_saturday_checks_bookings_first_and_reconciles_without_replay(self):
+        args = self.superficie_args()
+        dry_run = self.run_command(*args)
+        self.assertTrue(dry_run["dry_run"])
+        self.assertEqual(dry_run["requested_shifts"], [["07:00", "14:00"], ["14:00", "23:00"]])
+        self.assertEqual(dry_run["space"], "PSC-17")
+        self.assertEqual(self.form.events, ["read"])
+        self.assertFalse(self.form.intent.exists())
+
+        self.form.timeout = True
+        first = self.run_command(*args, "--confirm")
+        self.assertEqual(first["outcome"], "unknown")
+        self.assertEqual(first["space"], "PSC-17")
+        original_intent = self.form.intent.read_bytes()
+        intent = read_intent(self.form.intent)
+        self.assertEqual((intent.date, intent.floor, intent.start_time, intent.end_time),
+                         ("2026-11-21", self.form.floor, "07:00", "23:00"))
+        write_json(self.form.intent.with_suffix(RETRY_PERMISSION), {
+            "version": 1, "action": "retry-identical-selection-once",
+            "original_intent_sha256": sha256(original_intent).hexdigest(),
+            "at": "offline fixture", "basis": "offline fixture",
+        })
+        self.assertEqual(self.run_command(*args, "--confirm")["outcome"], "unknown")
+        self.assertEqual(self.form.clicks, 1)
+        self.form.after_submit = ["November 21, 2026\nPSC-17"]
+        self.form.details = "PSC-17\nBuilding\nNEWTON, Parking Superficie C\n07:00–14:00\n14:00–23:00"
+        recovered = self.run_command(*args, "--confirm")
+        self.assertEqual(recovered["outcome"], "confirmed")
+        self.assertTrue(recovered["reconciled"])
+        self.assertNotIn("confirmation_reference", recovered)
+        self.assertEqual(self.form.events[-2:], ["reload", "details"])
+        self.assertEqual(self.form.clicks, 1)
+        self.assertEqual(self.form.intent.read_bytes(), original_intent)
+
+    def test_superficie_other_dates_use_displayed_shifts(self):
+        args = self.superficie_args("2026-11-24")
+        self.form.span = ("08:00", "21:00")
+        result = self.run_command(*args)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual((result["date"], result["start_time"], result["end_time"]),
+                         ("2026-11-24", "08:00", "21:00"))
+        self.assertNotIn("requested_shifts", result)
+
+    def test_superficie_statusless_card_needs_linked_details_and_no_conflict(self):
+        self.superficie_args()
+        selection = Selection("2026-11-21", "07:00", "23:00", "NEWTON", self.form.floor, self.form.space)
+        card = "November 21, 2026\nPSC-17\n07:00–23:00\nNEWTON, Parking Superficie C"
+        self.form.after_submit = [card]
+        for details in (
+            None,
+            card.replace("PSC-17", "PSC-18"),
+            card.replace("23:00", "22:00"),
+            card.replace("November 21", "November 22"),
+            card.replace("Parking Superficie C", "Parking Torres Quevedo"),
+            card + "\nStatus: Pending approval",
+            card + "\nStatus: Failed",
+        ):
+            with self.subTest(details=details):
+                self.form.details = details
+                result = verify_booking([card], selection, self.form, recovered=True, base_url="about:blank")
+                self.assertEqual(result["outcome"], "unknown")
+        for records in ([card + "\nPending confirmation"], [card, card + "\nStatus: Rejected"]):
+            with self.subTest(records=records):
+                result = verify_booking(records, selection, self.form, recovered=True, base_url="about:blank")
+                self.assertEqual(result["outcome"], "unknown")
+        refusal = "Bookker reported a booking date or booking window restriction."
+        result = verify_booking([], selection, self.form, recovered=False, base_url="about:blank",
+                                observation={"book": refusal})
+        self.assertEqual(result["outcome"], "refused")
+        self.assertEqual(result["reason"], refusal)
 
     def test_exact_date_stops_at_an_existing_reservation(self):
         self.form.existing = [MATCH.replace("November 23", "November 26")]
@@ -615,10 +865,16 @@ class ParkingCommandTests(unittest.TestCase):
             nested.count.return_value = 2
             first = MATCH.strip().replace("November 23", "November 26")
             second = first.replace("PTQ-123", "PTQ-124")
-            rows.evaluate_all.return_value = [("", "layout"), (first, "row"), (second, "row")]
+            rows.evaluate_all.return_value = [("", "layout"), (first, "row", 1), (second, "row", 2)]
             self.assertEqual(read(), [first, second])
             self.assertEqual(parking_dates(read(), form), {day})
             self.assertEqual(rows.evaluate_all.call_args.args[1], BOOKING_LIST_ROWS)
+            rows.nth.return_value.evaluate.return_value = True
+            form.bookings("https://bookker.test/", day, reload=False, row_text=second)
+            rows.nth.assert_called_once_with(2)
+            text, token = rows.nth.return_value.evaluate.call_args.args[1]
+            self.assertEqual(text, second)
+            page.locator.assert_called_with(f'[data-bookker-cli-row="{token}"]')
             sibling_rows.count.return_value = 1
             with self.assertRaisesRegex(BookingProblem, "outside its active results list"):
                 read()
@@ -733,6 +989,23 @@ class ParkingCommandTests(unittest.TestCase):
                 form.whole_day(TORRES_SHIFTS)
             evening.inner_text.return_value = "14:00–22:00"
             self.assertIsNone(form.whole_day(TORRES_SHIFTS))
+
+    def test_live_shift_selection_verifies_every_contiguous_shift(self):
+        page = Mock()
+        chips = page.locator.return_value.filter.return_value
+        hours = ("08:00–12:00", "12:00–16:00", "16:00–21:00")
+        shifts = [locator(text=interval) for interval in hours]
+        for shift in shifts:
+            shift.locator.return_value = locator(0)
+            shift.evaluate.side_effect = [False, True]
+        chips.or_.return_value.filter.return_value.all.return_value = shifts
+        form = ParkingForm(page)
+        with patch.object(form, "label", return_value=locator(0)):
+            self.assertEqual(form.whole_day(verify_all=True), (("08:00", "21:00"), False))
+            for shift in shifts:
+                shift.click.assert_called_once()
+            shifts[1].inner_text.return_value = "13:00–16:00"
+            self.assertIsNone(form.whole_day(verify_all=True))
 
     def test_exact_calendar_skips_unrequested_cells_even_if_available(self):
         page, control = Mock(), Mock()

@@ -6,7 +6,8 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from parking_booking import book_parking
+from parking_booking import book_parking, superficie_request
+from parking_cancellation import cancel_parking
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, BrowserContext, Page
@@ -264,9 +265,13 @@ class BookkerClient:
         submission_state: Optional[Path] = None,
         result_file: Optional[Path] = None,
     ) -> Dict[str, Any]:
-        return book_parking(
+        result = book_parking(
             self, building=building, floor=floor, from_date=from_date, on_date=on_date,
             whole_day=whole_day, spot_name=spot_name, spot_id=spot_id,
             confirm_click=confirm_click, submission_state=submission_state,
             result_file=result_file,
         )
+        return {**superficie_request(on_date, building, floor), **result}
+
+    def cancel(self, *, target, confirm, state, show_preview):
+        return cancel_parking(self, target=target, confirm=confirm, state=state, show_preview=show_preview)

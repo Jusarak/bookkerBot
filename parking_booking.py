@@ -13,12 +13,15 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic
 from urllib.parse import urlsplit
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 MADRID = "Europe/Madrid"
 FIRST_DAY = date(2026, 11, 19)
 TORRES_DATE = date(2026, 11, 26)
 TORRES_SHIFTS = (("07:00", "14:00"), ("14:00", "23:00"))
+SUPERFICIE_SATURDAY = date(2026, 11, 21)
+SUPERFICIE_SATURDAY_SHIFTS = (("07:00", "14:00"), ("14:00", "23:00"))
 RECONCILE = "Check the intended reservation in Bookker Bookings before retrying."
 SIGN_IN = "Renew the saved session through normal Bookker sign-in and rerun."
 CHECK_UI = "Check the indicated view in Bookker before rerunning."
@@ -57,14 +60,16 @@ SUBMISSION_FEEDBACK = (
      r"(?:could not|cannot|unable to) (?:book|reserve|(?:create|complete|confirm)(?: the| your| a)? (?:booking|reservation))|"
      r"no se pudo (?:reservar|confirmar|crear la reserva))\b",
      "Bookker displayed an error or refused the booking action."),
+    (r"\b(?:booking (?:request )?(?:is |was )?pending|pending (?:approval|confirmation)|"
+     r"reserva pendiente|pendiente de (?:aprobaci[oó]n|confirmaci[oó]n))\b",
+     "Bookker displayed a pending booking or approval status."),
     (r"\b(?:(?:booking|reservation) (?:is |was |has been )?(?:confirmed|successful|created|submitted)|"
      r"successfully (?:booked|reserved)|(?:booked|reserved) successfully|"
      r"reserva (?:confirmada|realizada|creada|enviada)|se ha realizado la reserva)\b",
      "Bookker displayed a booking acknowledgement."),
-    (r"\b(?:booking (?:request )?(?:is |was )?pending|pending (?:approval|confirmation)|"
-     r"reserva pendiente|pendiente de (?:aprobaci[oó]n|confirmaci[oó]n))\b",
-     "Bookker displayed a pending booking or approval status."),
 )
+REFUSAL_MESSAGES = {message for _, message in SUBMISSION_FEEDBACK[:5]}
+PENDING_MESSAGE = SUBMISSION_FEEDBACK[-2][1]
 
 TIME = r"(?:[01]?\d|2[0-4]):[0-5]\d(?:\s*[ap]\.?m\.?)?"
 INTERVAL = re.compile(rf"(?<!\d)({TIME})\s*[-–—−]\s*({TIME})(?!\d)", re.I)
@@ -91,14 +96,27 @@ BOOKING_ROWS = (
     "[data-testid=booking], [data-testid=booking-row], [data-testid=booking-card]"
 )
 BOOKING_ARTICLE = "article.list-container"
-BOOKING_LIST_ROWS = f"{BOOKING_ROWS}, mat-list-item, [role=listitem]"
+BOOKING_LIST_ROWS = (
+    f"{BOOKING_ROWS}, mat-list-item, [role=listitem], "
+    f":is(app-booking, app-reservation):not(:has({BOOKING_ROWS}, mat-list-item, mat-card, [role=listitem]))"
+)
 BOOKING_LOADING = "[aria-busy=true], [role=progressbar], mat-spinner, mat-progress-spinner"
 CONFIRMED_STATUS = re.compile(r"confirmed|booked|reserved|approved|confirmad[ao]|reservad[ao]|aprobad[ao]", re.I)
 INACTIVE = re.compile(r"cancelled|canceled|expired|rejected|rechazad[ao]|cancelad[ao]|caducad[ao]", re.I)
-UNVERIFIED_STATUS = re.compile(r"pending(?: approval)?|requested|pendiente(?: de aprobación)?", re.I)
+UNVERIFIED_STATUS = re.compile(r"(?:(?:booking|reservation) (?:is )?)?pending(?: approval| confirmation)?|"
+                               r"requested|pendiente(?: de aprobación| de confirmación)?", re.I)
+FAILED_STATUS = re.compile(r"(?:(?:booking|reservation) (?:has )?)?(?:failed|declined|error)|"
+                           r"fallid[ao]|denegad[ao]", re.I)
+ALL_PERIOD = re.compile(r"\ball (?:time|dates|upcoming(?: bookings)?|bookings)\b|"
+                        r"\btodas las reservas\b|^(?:all|todas)$", re.I)
 PERIOD = re.compile(r"\b(?:This (?:week|month|year)|Next (?:week|month|year|\d+ days)|"
-                    r"Today|Tomorrow|All (?:time|dates))\b", re.I)
+                    r"Today|Tomorrow)\b|" + ALL_PERIOD.pattern, re.I)
 STATUS_FIELD = r"(?:Booking )?Status|Estado(?: de la reserva)?"
+SPACE_FIELD = r"Parking space|Space|Plaza|Resource|Recurso"
+REFERENCE_FIELD = (r"Reference|Confirmation(?: (?:reference|code|number|ID))?|"
+                   r"Booking (?:reference|number|ID)|Reservation (?:reference|number|ID)|"
+                   r"Referencia(?: de (?:reserva|confirmación))?")
+REFERENCE_CODE = r"[\w#-]{1,80}"
 SPACE_CODE = r"[\w][\w .#/-]{0,47}"
 DATE_TEXT = re.compile(
     r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}|"
@@ -260,8 +278,29 @@ def torres_shifts(day, building, floor):
     return ()
 
 
+def is_superficie(building, floor):
+    return normalized(building) == "newton" and normalized(floor) == "parking superficie c"
+
+
+def required_shifts(day, building, floor):
+    if day == SUPERFICIE_SATURDAY and is_superficie(building, floor):
+        return SUPERFICIE_SATURDAY_SHIFTS
+    return torres_shifts(day, building, floor)
+
+
+def shift_span(shifts):
+    ordered = sorted(shifts)
+    if ordered and all(left[1] == right[0] for left, right in zip(ordered, ordered[1:])):
+        return ordered[0][0], ordered[-1][1]
+    return None
+
+
 def period_covers(label, day, today, day_first):
     label = normalized(label)
+    if ALL_PERIOD.search(label):
+        return True
+    if day is None:
+        return False
     explicit = sorted(dates(label, day_first))
     if len(explicit) == 2:
         return explicit[0] <= day <= explicit[1]
@@ -272,8 +311,6 @@ def period_covers(label, day, today, day_first):
     if not period:
         return False
     label = period[0]
-    if label.startswith("all "):
-        return True
     if label in {"today", "tomorrow"}:
         return day == today + timedelta(days=label == "tomorrow")
     if label.endswith(" week"):
@@ -310,10 +347,8 @@ def field(text, labels):
 
 def booking_statuses(text):
     labelled = list(field_values(text, STATUS_FIELD))
-    if labelled:
-        return labelled
-    return [part for part in fields(text) if any(pattern.fullmatch(part) for pattern in (
-        CONFIRMED_STATUS, INACTIVE, UNVERIFIED_STATUS,
+    return labelled + [part for part in fields(text) if any(pattern.fullmatch(part) for pattern in (
+        CONFIRMED_STATUS, INACTIVE, UNVERIFIED_STATUS, FAILED_STATUS,
     ))]
 
 
@@ -342,7 +377,7 @@ def shows_location(text, building, floor):
         full_values = {normalized(value) for value in field_values(text, building_labels, split_inline=False)}
         if not combined <= full_values or any(not pair.fullmatch(value) for value in combined):
             return False
-    lines = [re.sub(r"^(?:location_on|place)\s+", "", normalized(line)) for line in text.splitlines()]
+    lines = [re.sub(r"^(?:location_on\s*|place\s+)", "", normalized(line)) for line in text.splitlines()]
     labelled = list(field_values("\n".join(lines), r"Location|Ubicación", split_inline=False))
     if labelled:
         return all(pair.fullmatch(line) for line in labelled)
@@ -352,8 +387,12 @@ def shows_location(text, building, floor):
 
 
 def booking_space(text):
-    label = field(text, r"Parking space|Space|Plaza|Resource|Recurso")
-    return label if re.fullmatch(SPACE_CODE, label) else ""
+    names = set(field_values(text, SPACE_FIELD))
+    return next(iter(names)) if len(names) == 1 and re.fullmatch(SPACE_CODE, next(iter(names))) else ""
+
+
+def booking_references(text):
+    return {value for value in field_values(text, REFERENCE_FIELD) if re.fullmatch(REFERENCE_CODE, value)}
 
 
 def shows_all_day(text):
@@ -612,7 +651,7 @@ class ParkingForm:
             self.settled()
         raise BookingProblem("Bookker did not expose a bounded booking window.")
 
-    def whole_day(self, expected_shifts=()):
+    def whole_day(self, expected_shifts=(), *, verify_all=False):
         page = self.page
         all_day = self.label(ALL_DAY)
         chips = page.locator("mat-chip-option").filter(has_text=INTERVAL)
@@ -629,7 +668,7 @@ class ParkingForm:
                     or re.search(r"shift ended|turno finalizado", text, re.I)):
                 return None
             interval = schedule.pop()
-            if expected_shifts and interval in shifts:
+            if (expected_shifts or verify_all) and interval in shifts:
                 raise BookingProblem("Bookker displayed the same parking shift more than once.")
             shifts[interval] = shift, action
         if not shifts:
@@ -637,23 +676,24 @@ class ParkingForm:
             if empty.count():
                 return None
             raise BookingProblem("Bookker did not display parking shift hours to verify a whole day.")
-        if expected_shifts:
-            if set(shifts) != set(expected_shifts):
+        if expected_shifts or verify_all:
+            span = shift_span(shifts)
+            if not span or (expected_shifts and set(shifts) != set(expected_shifts)):
                 return None
             selected = """(el) => {
                 const active = '[aria-selected=true], [aria-pressed=true], [aria-checked=true]';
                 return el.matches(active + ', .mat-mdc-chip-selected, .mat-chip-selected, ' +
                     '.mdc-evolution-chip--selected') || !!el.querySelector(active);
             }"""
-            for interval in expected_shifts:
-                shift, action = shifts[interval]
+            for shift, action in (shifts[interval] for interval in sorted(shifts)):
                 if not shift.evaluate(selected):
                     action.click()
             self.settled()
             if not all(shift.evaluate(selected) for shift, _ in shifts.values()):
-                raise BookingProblem("Bookker did not retain both requested parking shifts.",
-                                     "Check that both parking shifts are selected before searching.")
-            return (expected_shifts[0][0], expected_shifts[-1][1]), False
+                quantity = "both" if len(shifts) == 2 else "all"
+                raise BookingProblem(f"Bookker did not retain {quantity} requested parking shifts.",
+                                     "Check that all parking shifts are selected before searching.")
+            return span, False
 
         use_all_day = bool(all_day.count() and all_day.is_enabled())
         start = min(shifts)
@@ -849,8 +889,9 @@ class ParkingForm:
                 right_date = not re.search(r"\b(?:Date|Fecha)\b|(?<!\d)\d{1,2}/\d{1,2}", details, re.I)
             if not hours:
                 right_hours = whole_day_shown or not re.search(rf"\b(?:Time|Schedule|Horario)\b|{TIME}", details, re.I)
-            expected = torres_shifts(day, building, floor)
-            if expected and hours == set(expected):
+            expected = required_shifts(day, building, floor)
+            if ((expected and hours == set(expected))
+                    or (is_superficie(building, floor) and not expected and shift_span(hours) == span)):
                 right_hours = True
         if (
             submit.count() != 1 or not submit.is_enabled()
@@ -896,14 +937,14 @@ class ParkingForm:
                 continue
             readable = True
             new_text = "\n".join(line for line in body.splitlines() if normalized(line) not in baseline)
-            for pattern, message in SUBMISSION_FEEDBACK[:-1]:
+            for pattern, message in SUBMISSION_FEEDBACK:
                 if re.search(pattern, new_text, re.I):
+                    if message == PENDING_MESSAGE:
+                        pending = message
+                        break
                     return message, None
-            status_pattern, status_message = SUBMISSION_FEEDBACK[-1]
-            if re.search(status_pattern, new_text, re.I):
-                pending = status_message
             try:
-                prompt = self.final_prompt() if watch_final else None
+                prompt = self.final_prompt() if watch_final and not pending else None
             except Exception:
                 prompt = None
             text = prompt[1] if prompt else None
@@ -1016,7 +1057,7 @@ class ParkingForm:
             raise problem from None
         raise problem
 
-    def bookings(self, base_url, day, *, reload):
+    def bookings(self, base_url, day, *, reload, include_inactive=False, row_text=None):
         if reload or not self.in_bookings():
             # Leave the parking form before using the navigation links. It can
             # cover them while the form or its review dialog is open.
@@ -1112,6 +1153,7 @@ class ParkingForm:
                     raise BookingProblem("Bookker showed reservation rows outside its active results list.",
                                          "Check which reservations are shown for the selected period in Bookker.")
             cards = rows.evaluate_all(r"""(rows, bookingRows) => {
+                const positions = new Map(rows.map((row, index) => [row, index]));
                 const explicit = rows.filter(row => row.matches(bookingRows));
                 // Generic cards inside an explicit row are part of that row.
                 const candidates = rows.filter(row => row.matches(bookingRows) ||
@@ -1127,7 +1169,7 @@ class ParkingForm:
                     const text = row.innerText.trim();
                     const nested = children.get(row);
                     if (!nested.length) {
-                        return [text, row.matches(bookingRows) ? 'row' : 'card'];
+                        return [text, row.matches(bookingRows) ? 'row' : 'card', positions.get(row)];
                     }
                     // Keep nested rows separate and check that the outer
                     // card contains only layout text outside them.
@@ -1150,12 +1192,13 @@ class ParkingForm:
                 marker = re.escape(empty_text)
                 layout = rf"(?:{layout}|{layout}\s*{marker}|{marker}\s*{layout})"
             if any(kind == "layout" and (text is None or not re.fullmatch(layout, normalized(text)))
-                   for text, kind in cards):
+                   for text, kind, *_ in cards):
                 raise BookingProblem("Bookker did not expose separate reservation rows.",
                                      "Check the reservation rows in Bookings for the selected period.")
-            texts = [text for text, kind in cards if kind == "row" or (
-                kind == "card" and text and not re.fullmatch(layout, normalized(text))
+            records = [card for card in cards if card[1] == "row" or (
+                card[1] == "card" and card[0] and not re.fullmatch(layout, normalized(card[0]))
             )]
+            texts = [card[0] for card in records]
             if empty_text and texts:
                 raise BookingProblem("Bookker showed row content alongside its Bookings empty state.",
                                      "Check which reservations are shown for the selected period in Bookker.")
@@ -1166,9 +1209,22 @@ class ParkingForm:
             if snapshot in seen:
                 raise BookingProblem("Bookker's Bookings list did not advance to another page.")
             seen.add(snapshot)
+            if row_text is not None and row_text in texts:
+                if texts.count(row_text) != 1:
+                    raise BookingProblem("The selected Bookings row became ambiguous.")
+                _, _, index = next(card for card in records if card[0] == row_text)
+                token = uuid4().hex
+                marked = rows.nth(index).evaluate("""(el, [expected, token]) => {
+                    if (!el.isConnected || el.innerText.trim() !== expected) return false;
+                    el.setAttribute('data-bookker-cli-row', token);
+                    return true;
+                }""", [row_text, token], timeout=1000)
+                if not marked:
+                    raise BookingProblem("The selected Bookings row changed before it could be opened.")
+                return self.page.locator(f'[data-bookker-cli-row="{token}"]')
             for text in texts:
                 statuses = booking_statuses(text)
-                if not statuses or not all(INACTIVE.fullmatch(status) for status in statuses):
+                if include_inactive or not statuses or not all(INACTIVE.fullmatch(status) for status in statuses):
                     result.append(text)
             following = visible(view.get_by_role(
                 "button", name=re.compile(r"^(?:Next page|Página siguiente)$", re.I)
@@ -1179,6 +1235,56 @@ class ParkingForm:
             self.settled()
             with self.parking_step("Bookker did not finish loading the next Bookings page.", results_action):
                 loading.wait_for(state="hidden", timeout=10_000)
+
+    def booking_row(self, base_url, day, record):
+        row = self.bookings(base_url, day, reload=True, row_text=record)
+        if isinstance(row, list) or row.count() != 1 or row.inner_text(timeout=1000).strip() != record:
+            raise BookingProblem("The selected Bookings row changed before it could be opened.")
+        return row
+
+    def booking_details(self, base_url, day, record, space):
+        row = self.booking_row(base_url, day, record)
+        details_name = re.compile(r"^(?:(?:View|Show|Open) )?(?:(?:booking|reservation) )?"
+                                  r"(?:details|details of (?:booking|reservation))$|"
+                                  r"^(?:View|Show|Open) (?:booking|reservation)$|"
+                                  r"^(?:Ver )?detalles(?: de la reserva)?$", re.I)
+        detail_href = ('a:is([href*="/booking/"], [href*="/bookings/"], [href*="/reservation/"])'
+                       ':not([href*="/map"], [href*="/delete"])')
+        action = row.get_by_role("link", name=details_name).or_(
+            row.get_by_role("button", name=details_name)
+        ).or_(row.get_by_role("link", name=space, exact=True)).or_(row.locator(detail_href)).or_(
+            row.and_(self.page.locator(detail_href))
+        )
+        action = visible(action)
+        if action.count() != 1 or not action.is_enabled(timeout=1000):
+            raise BookingProblem("The matching Bookings row did not expose one booking details link.")
+        if row.inner_text(timeout=1000).strip() != record:
+            raise BookingProblem("The matching Bookings row changed before its details could be opened.")
+        before = self.page.url
+        details = visible(self.page.locator(
+            "app-booking-details, app-reservation-details, [data-testid=booking-details]"
+        ))
+        details_were_open = details.count() != 0
+        action.click(timeout=5000)
+        self.settled()
+        self.check_session()
+        dialogs = visible(self.page.get_by_role("dialog").or_(
+            self.page.locator("mat-dialog-container, ion-modal")
+        ))
+        if dialogs.count() == 1:
+            return dialogs.inner_text(timeout=1000)
+        if not dialogs.count() and not details_were_open and details.count() == 1:
+            return details.inner_text(timeout=1000)
+        if not dialogs.count() and self.page.url != before:
+            route = urlsplit(self.page.url)
+            detail_route = re.compile(r"/(?:bookings?|reservations?)/[^/]+(?:/details)?/?$")
+            if not self.in_bookings() or any(detail_route.search(path) for path in (
+                route.path, route.fragment.split("?", 1)[0],
+            )):
+                main = visible(self.page.get_by_role("main"))
+                if main.count() == 1:
+                    return main.inner_text(timeout=1000)
+        raise BookingProblem("Bookker did not display separate details for the matching reservation.")
 
 
 def booking_dates(records, form):
@@ -1203,45 +1309,107 @@ def parking_dates(records, form):
 
 def shows_interval(record, selection):
     day = date.fromisoformat(selection.date)
-    shifts = torres_shifts(day, selection.building, selection.floor)
+    shifts = required_shifts(day, selection.building, selection.floor)
     span = (selection.start_time, selection.end_time)
     shown_hours = intervals(record)
     return (shown_hours == {span}
-            or (shifts and span == (shifts[0][0], shifts[-1][1]) and shown_hours == set(shifts))
+            or (shifts and span == (shifts[0][0], shifts[-1][1]) and shown_hours - {span} == set(shifts))
+            or (not shifts and is_superficie(selection.building, selection.floor)
+                and shift_span(shown_hours - {span}) == span)
             or (selection.all_day and not INTERVAL.search(record) and shows_all_day(record)))
 
 
-def verify_booking(records, selection, form, recovered):
+def verify_booking(records, selection, form, recovered, *, base_url=None, observation=None):
     day = date.fromisoformat(selection.date)
+    superficie = is_superficie(selection.building, selection.floor)
+    refusal = next((message for message in sorted(REFUSAL_MESSAGES)
+                    if any(value.endswith(message) for value in (observation or {}).values())), None)
+    pending = any(value.endswith(PENDING_MESSAGE) for value in (observation or {}).values())
+
+    def matching_space(record):
+        return shows(record, SPACE_FIELD, selection.space)
+
+    def matching_location(record):
+        return shows_location(record, selection.building, selection.floor)
+
+    def complete(record):
+        return shows_interval(record, selection) and matching_location(record)
+
+    def has_hours(record):
+        return INTERVAL.search(record) or shows_all_day(record) or list(field_values(record, r"Time|Schedule|Horario"))
 
     def matches(record):
-        return (
-            dates(record, form.day_first) == {day}
-            and shows_interval(record, selection)
-            and shows_location(record, selection.building, selection.floor)
-            and shows(record, r"Parking space|Space|Plaza|Resource|Recurso", selection.space)
-        )
+        if dates(record, form.day_first) != {day} or not matching_space(record):
+            return False
+        if complete(record):
+            return True
+        if base_url is None:
+            return False
+        has_location = (list(field_values(record, r"Building|Edificio|Floor|Planta|Location|Ubicación"))
+                        or re.search(r"^\s*(?:location_on|place\s)|(?:[,/·]\s*parking\s+\w)", record, re.M | re.I))
+        return not has_location or matching_location(record)
 
     matches = [record for record in records if matches(record)]
     if len(matches) != 1:
+        if not matches and refusal and superficie:
+            return outcome("refused", refusal, RECONCILE)
         reason = ("Reloaded Bookings showed multiple matching reservations." if matches
                   else "Reloaded Bookings did not show a verifiable matching reservation.")
         return outcome("unknown", reason, RECONCILE)
 
-    statuses = booking_statuses(matches[0])
-    if not statuses or not all(CONFIRMED_STATUS.fullmatch(status) for status in statuses):
+    record, = matches
+    statuses = booking_statuses(record)
+    references = booking_references(record)
+    linked = False
+    if has_hours(record) and not shows_interval(record, selection):
+        return outcome("unknown", "The reloaded reservation showed a different or unreadable schedule.", RECONCILE)
+    if statuses:
+        if not all(CONFIRMED_STATUS.fullmatch(status) for status in statuses) or not complete(record):
+            return outcome("unknown", "The matching Bookings record showed an unconfirmed or conflicting status or schedule.",
+                           RECONCILE)
+    elif pending or refusal:
+        return outcome("unknown", refusal or PENDING_MESSAGE, RECONCILE)
+    elif base_url is None:
         return outcome("unknown", "The matching record in reloaded Bookings did not show a confirmed status.",
                        RECONCILE)
+    else:
+        try:
+            details = form.booking_details(base_url, day, record, selection.space)
+        except BookingProblem as error:
+            return outcome("unknown", error.reason, RECONCILE)
+        detail_statuses = booking_statuses(details)
+        detail_days = dates(details, form.day_first)
+        references |= booking_references(details)
+        if (not matching_space(details) or not complete(details)
+                or (detail_days and detail_days != {day})
+                or any(not CONFIRMED_STATUS.fullmatch(status) for status in detail_statuses)):
+            return outcome("unknown", "Linked booking details did not corroborate the reloaded reservation.", RECONCILE)
+        linked = True
+
+    if len(references) > 1:
+        return outcome("unknown", "Reloaded Bookings and its details showed conflicting references.", RECONCILE)
 
     receipt = {"outcome": "confirmed", "timezone": MADRID, **asdict(selection)}
-    reference = field(matches[0], r"Confirmation(?: (?:reference|code|number|ID))?|"
-                      r"Booking (?:reference|number|ID)|Reservation (?:reference|number|ID)|"
-                      r"Referencia(?: de (?:reserva|confirmación))?")
-    if re.fullmatch(r"[\w#-]{1,80}", reference):
-        receipt["confirmation_reference"] = reference
+    if references:
+        receipt["confirmation_reference"] = references.pop()
+    if linked:
+        receipt["reason"] = "Linked booking details corroborated the statusless reservation in reloaded Bookings."
+    elif superficie:
+        receipt["reason"] = "The exact reservation showed a confirmed status in reloaded Bookings."
     if recovered:
         receipt["reconciled"] = True
     return receipt
+
+
+def superficie_request(day, building, floor):
+    if not day or not building or not floor or not is_superficie(building, floor):
+        return {}
+    request = {"date": day.isoformat(), "timezone": MADRID, "building": building, "floor": floor}
+    if day == SUPERFICIE_SATURDAY:
+        shifts = SUPERFICIE_SATURDAY_SHIFTS
+        request.update(start_time=shifts[0][0], end_time=shifts[-1][1],
+                       requested_shifts=[list(shift) for shift in shifts])
+    return request
 
 
 def observe_submit(form, submit, before, *, watch_final):
@@ -1269,7 +1437,9 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
         return outcome("blocked", "A confirmed run requires a persistent submission state path.",
                        "Supply --submission-state and reuse that path for retries.")
 
-    expected_shifts = torres_shifts(on_date, building, floor)
+    expected_shifts = required_shifts(on_date, building, floor)
+    is_surface = is_superficie(building, floor)
+    request = superficie_request(on_date, building, floor)
     pending, digest = None, None
     if submission_state is not None:
         try:
@@ -1298,10 +1468,21 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
     phase = "open the browser with the saved session"
     submitted_or_pending = pending is not None
     observation = {}
+
+    def selected_details(selection):
+        return asdict(selection) if is_surface and selection is not None else {}
+
+    def write_pending(selection):
+        data = {**PENDING_RESULT, **request, **selected_details(selection)}
+        if observation:
+            data["submission_observation"] = observation
+        write_json(result_file, data)
+
+    selection = pending
     try:
         if pending and result_file is not None:
             phase = "mark the saved submission as pending reconciliation"
-            write_json(result_file, PENDING_RESULT)
+            write_pending(pending)
             phase = "open the browser with the saved session"
         client.open_with_session(timezone_id=MADRID)
         form = ParkingForm(client.page)
@@ -1310,12 +1491,15 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
         if pending:
             phase = "reload Bookings and reconcile the saved submission"
             day = date.fromisoformat(pending.date)
-            records = form.bookings(client.base_url, day, reload=True)
-            reconciled = verify_booking(records, pending, form, recovered=True)
-            if (reconciled["outcome"] == "confirmed" or not confirm_click or not expected_shifts
+            records = form.bookings(client.base_url, day, reload=True, include_inactive=True)
+            reconciled = verify_booking(records, pending, form, recovered=True, base_url=client.base_url)
+            if (reconciled["outcome"] == "confirmed" or not confirm_click or not torres_shifts(on_date, building, floor)
                     or day < today or not retry_authorized(submission_state, digest)):
-                return reconciled
-            if day in booking_dates(records, form):
+                return {**selected_details(pending), **reconciled}
+            active = (record for record in records if not (
+                booking_statuses(record) and all(INACTIVE.fullmatch(status) for status in booking_statuses(record))
+            ))
+            if day in booking_dates(active, form):
                 return outcome("unknown", "Reloaded Bookings already showed a booking on the requested date.",
                                RECONCILE)
             if spot_name and normalized(spot_name) != normalized(pending.space):
@@ -1323,6 +1507,13 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                                RECONCILE)
             spot_name = pending.space
         earliest = on_date or max(from_date or FIRST_DAY, FIRST_DAY, today)
+        bookings_checked = bool(on_date and is_surface and not pending)
+        if bookings_checked:
+            phase = "read the account's Bookings for the requested date"
+            records = form.bookings(client.base_url, on_date, reload=False)
+            if on_date in parking_dates(records, form):
+                return outcome("unavailable", "Bookker already shows a parking booking for the requested date.",
+                               "Check the existing reservation in Bookker Bookings for that date.")
         vehicle = None
         while True:
             phase = "open the parking form to check the requested date"
@@ -1342,7 +1533,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                                          "Check the requested date in the Bookker parking calendar.")
             else:
                 earliest = day + timedelta(days=1)
-            if not pending:
+            if not pending and not bookings_checked:
                 phase = "read the account's Bookings for the candidate date"
                 records = form.bookings(client.base_url, day, reload=False)
                 if day in parking_dates(records, form):
@@ -1357,7 +1548,8 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                     raise BookingProblem("Bookker stopped offering the candidate date after the Bookings check.",
                                          "Check the offered date in the Bookker parking form before rerunning.")
             phase = "select one interval covering the displayed parking shifts"
-            schedule = form.whole_day(expected_shifts)
+            schedule = (form.whole_day(expected_shifts, verify_all=True) if is_surface
+                        else form.whole_day(expected_shifts))
             if schedule is None:
                 if on_date:
                     required = "07:00–14:00 and 14:00–23:00" if expected_shifts else "all required parking shifts"
@@ -1376,7 +1568,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             if on_date:
                 form.check_date(day)
             choice = form.select_space(building, floor, span, spot_name, spot_id,
-                                       require_material=bool(expected_shifts))
+                                       require_material=bool(expected_shifts) or is_surface)
             if choice is None:
                 if on_date:
                     reason = ("The saved space was unavailable for the full interval on the requested date." if pending
@@ -1397,7 +1589,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
 
             if result_file is not None:
                 phase = "write the pending result"
-                write_json(result_file, PENDING_RESULT)
+                write_pending(selection)
             phase = "capture the view before the Book action"
             watch_final = choice.material and form.final_prompt() is None
             before = form.submission_text()
@@ -1419,7 +1611,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             observation["book"], prompt = observe_submit(form, submit, before, watch_final=watch_final)
             if result_file is not None:
                 phase = "record the redacted response to Book"
-                write_json(result_file, {**PENDING_RESULT, "submission_observation": observation})
+                write_pending(selection)
             if prompt:
                 phase = "verify the separate final confirmation in Bookker"
                 final = form.verify_final_prompt(selection, vehicle, prompt)
@@ -1445,29 +1637,33 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                         )
                 if result_file is not None:
                     phase = "record the redacted final confirmation response"
-                    write_json(result_file, {**PENDING_RESULT, "submission_observation": observation})
+                    write_pending(selection)
             phase = "reload Bookings and verify the submitted reservation"
-            records = form.bookings(client.base_url, day, reload=True)
-            return {**verify_booking(records, selection, form, recovered=False),
+            records = form.bookings(client.base_url, day, reload=True, include_inactive=True)
+            return {**selected_details(selection),
+                    **verify_booking(records, selection, form, recovered=False, base_url=client.base_url,
+                                     observation=observation),
                     "submission_observation": observation}
     except BookingProblem as error:
         status = "unknown" if submitted_or_pending else "blocked"
         action = error.next_action
         if submitted_or_pending:
             action = RECONCILE if action == CHECK_UI else f"{action} {RECONCILE}"
-        return outcome(status, error.reason, action, observation=observation)
+        return {**selected_details(selection), **outcome(status, error.reason, action, observation=observation)}
     except FileNotFoundError:
         if phase == "open the browser with the saved session":
             return outcome("unknown" if submitted_or_pending else "blocked",
                            "The saved Bookker session is missing.",
                            f"{SIGN_IN} {RECONCILE}" if submitted_or_pending else SIGN_IN)
         action = "Supply existing directories for the result and submission state paths."
-        return outcome("unknown" if submitted_or_pending else "blocked", f"The run could not {phase}.",
-                       f"{action} {RECONCILE}" if submitted_or_pending else action, observation=observation)
+        return {**selected_details(selection), **outcome(
+            "unknown" if submitted_or_pending else "blocked", f"The run could not {phase}.",
+            f"{action} {RECONCILE}" if submitted_or_pending else action, observation=observation)}
     except OSError:
         action = "Check permissions for the supplied result and submission state directories."
-        return outcome("unknown" if submitted_or_pending else "blocked", f"The run could not {phase}.",
-                       f"{action} {RECONCILE}" if submitted_or_pending else action, observation=observation)
+        return {**selected_details(selection), **outcome(
+            "unknown" if submitted_or_pending else "blocked", f"The run could not {phase}.",
+            f"{action} {RECONCILE}" if submitted_or_pending else action, observation=observation)}
     except Exception:
         # Browser exceptions can contain URLs, HTML, or a vehicle label.
         action = RECONCILE if submitted_or_pending else CHECK_UI
@@ -1475,5 +1671,6 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             action = "Check the configured Playwright browser runtime and saved Bookker session."
             if submitted_or_pending:
                 action = f"{action} {RECONCILE}"
-        return outcome("unknown" if submitted_or_pending else "blocked",
-                       f"The run could not {phase}.", action, observation=observation)
+        return {**selected_details(selection), **outcome(
+            "unknown" if submitted_or_pending else "blocked", f"The run could not {phase}.",
+            action, observation=observation)}
