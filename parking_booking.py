@@ -431,7 +431,7 @@ def card_locations(text):
             locations.append(value.strip())
             continue
         # Adjacent schedule and location spans can share a line with a trailing floor detail.
-        schedule = re.match(r"^schedule\s*", line, re.I)
+        schedule = re.match(r"^schedule\s*:?\s*", line, re.I)
         hours = INTERVAL.match(line, schedule.end()) if schedule else None
         if hours:
             location = line[hours.end():].strip()
@@ -1461,17 +1461,18 @@ def shows_interval(record, selection):
 
 def verify_booking(records, selection, form, recovered, *, base_url=None, observation=None):
     day = date.fromisoformat(selection.date)
+    location = selection.building, selection.floor
+    space_names = {normalized(selection.space)}
     superficie = is_superficie(selection.building, selection.floor)
     refusal = next((message for message in sorted(REFUSAL_MESSAGES)
                     if any(value.endswith(message) for value in (observation or {}).values())), None)
     pending = any(value.endswith(PENDING_MESSAGE) for value in (observation or {}).values())
 
     def matching_space(record):
-        spaces = displayed_spaces(record, form.day_first, (selection.building, selection.floor))
-        return spaces.keys() == {normalized(selection.space)}
+        return displayed_spaces(record, form.day_first, location).keys() == space_names
 
     def matching_location(record):
-        return shows_location(record, selection.building, selection.floor)
+        return shows_location(record, *location)
 
     def complete(record):
         return shows_interval(record, selection) and matching_location(record)
@@ -1479,13 +1480,15 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
     def has_hours(record):
         return INTERVAL.search(record) or shows_all_day(record) or list(field_values(record, r"Time|Schedule|Horario"))
 
+    def has_location(record):
+        return list(field_values(record, LOCATION_FIELD)) or card_locations(record)
+
     def matches(record):
         if complete(record):
             return True
         if base_url is None:
             return False
-        has_location = list(field_values(record, LOCATION_FIELD)) or card_locations(record)
-        return not has_location or matching_location(record)
+        return not has_location(record) or matching_location(record)
 
     candidates = [record for record in records if dates(record, form.day_first) == {day} and matching_space(record)]
     matches = [record for record in candidates if matches(record)]
@@ -1531,7 +1534,23 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
 
     receipt = {"outcome": "confirmed", "timezone": MADRID, **asdict(selection)}
     if references:
-        receipt["confirmation_reference"] = references.pop()
+        reference, = references
+        for other in records:
+            if other == record:
+                continue
+            other_references = booking_references(other)
+            if reference not in other_references:
+                continue
+            other_days = dates(other, form.day_first)
+            other_spaces = displayed_spaces(other, form.day_first, location)
+            if (other_references != references or (other_days and other_days != {day})
+                    or (other_spaces and other_spaces.keys() != space_names)
+                    or (has_location(other) and not matching_location(other))
+                    or (has_hours(other) and not shows_interval(other, selection))
+                    or any(not CONFIRMED_STATUS.fullmatch(status) for status in booking_statuses(other))):
+                return outcome("unknown", "Reloaded Bookings showed conflicting details for the same reference.",
+                               RECONCILE)
+        receipt["confirmation_reference"] = reference
     if linked:
         receipt["reason"] = "Linked booking details corroborated the exact reservation in reloaded Bookings."
     if recovered:

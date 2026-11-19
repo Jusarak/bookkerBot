@@ -513,6 +513,26 @@ class CancellationCommandTests(unittest.TestCase):
         self.form.delete.click.assert_called_once()
         self.assertEqual(self.form.records, [self.form.neighbor])
 
+    def test_cancel_readback_preserves_saved_reference_with_changed_date(self):
+        for index, selector in enumerate((self.selector, ("--reference", "OFFLINE-123"))):
+            with self.subTest(selector=selector):
+                self.form = CancellationFixture()
+                state = self.state.with_name(f"cancel-{index}.json")
+                args = (*selector, "--confirm", "--submission-state", str(state))
+                changed = self.form.target.replace("November 26", "November 27")
+                self.form.delete.click.side_effect = lambda **kwargs: self.form.records.__setitem__(0, changed)
+                for _ in range(2):
+                    result = self.run_command(*args)
+                    self.assertEqual(result["outcome"], "unknown")
+                    self.assertIn("different date", result["reason"])
+                    self.assertEqual(self.form.records, [changed, self.form.neighbor])
+                unrelated = changed.replace("OFFLINE-123", "OFFLINE-456")
+                self.form.records[0] = unrelated
+                self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+                self.assertEqual(self.form.records, [unrelated, self.form.neighbor])
+                self.form.trigger.click.assert_called_once()
+                self.form.delete.click.assert_called_once()
+
     def test_wrong_ambiguous_and_absent_selectors_do_not_open_a_menu(self):
         confirm = ("--confirm", "--submission-state", str(self.state))
         for selector in (
@@ -550,6 +570,7 @@ class CancellationCommandTests(unittest.TestCase):
             "NEWTON (Parking Superficie C)",
             "Parking Torres Quevedo (OTHER BUILDING)",
             "schedule 07:00–23:00 NEWTON (Parking Superficie C)",
+            "Schedule: 07:00–23:00 NEWTON (Parking Superficie C)",
         )
         for layout_index, location in enumerate(conflicts):
             for selector_index, selector in enumerate((self.selector, ("--reference", "OFFLINE-123"))):
@@ -567,7 +588,7 @@ class CancellationCommandTests(unittest.TestCase):
                     self.form.trigger.click.assert_not_called()
 
     def test_parenthesized_row_location_resolves_for_reference_selector(self):
-        for prefix in ("", "schedule 07:00–23:00 "):
+        for prefix in ("", "schedule 07:00–23:00 ", "Schedule: 07:00–23:00 "):
             with self.subTest(prefix=prefix):
                 row = f"November 26, 2026\nPTQ-123\n{prefix}NEWTON (Parking Torres Quevedo)\nReference: OFFLINE-123"
                 self.form.records[0] = self.form.target = row
@@ -585,6 +606,9 @@ class CancellationCommandTests(unittest.TestCase):
             ("schedule 07:00–23:00location_on NEWTON, Parking Torres Quevedo", "cancelled"),
             ("schedule 07:00–23:00 NEWTON (Parking Superficie C)\n"
              "Building: NEWTON\nFloor: Parking Torres Quevedo", "unknown"),
+            ("Schedule: 07:00–23:00 NEWTON (Parking Superficie C)\n"
+             "Building: NEWTON\nFloor: Parking Torres Quevedo", "unknown"),
+            ("Schedule: 07:00–23:00 NEWTON (Parking Torres Quevedo)", "cancelled"),
             ("schedule 07:00–23:00 Parking Torres Quevedo (OTHER BUILDING)", "unknown"),
             ("schedule 07:00–23:00 NEWTON (Parking Torres Quevedo)", "cancelled"),
             ("location_on NEWTON, Parking Superficie C", "unknown"),
@@ -823,6 +847,31 @@ class ParkingCommandTests(unittest.TestCase):
         self.assertEqual(self.run_command(*args, "--confirm")["outcome"], "confirmed")
         self.assertEqual(self.form.clicks, 1)
 
+    def test_superficie_cli_checks_other_rows_with_corroborated_reference(self):
+        args = self.superficie_args() + ("--confirm",)
+        card = "November 21, 2026\nPSC-17\n07:00–23:00\nNEWTON, Parking Superficie C"
+        reference = "\nReference: OFFLINE-C17"
+        self.form.details = card + reference
+        conflicts = (
+            card.replace("Parking Superficie C", "Parking Torres Quevedo") + "\nStatus: Failed",
+            card.replace("Parking Superficie C", "Parking Torres Quevedo"),
+            card.replace("November 21", "November 22"),
+            card.replace("PSC-17", "PSC-18"),
+            "07:00–14:00",
+            "Status: Failed",
+        )
+        for conflict in conflicts:
+            with self.subTest(conflict=conflict):
+                self.form.after_submit = [card, conflict + reference]
+                result = self.run_command(*args)
+                self.assertEqual(result["outcome"], "unknown")
+                self.assertIn("same reference", result["reason"])
+        self.form.after_submit = [card, conflicts[0] + "\nReference: OFFLINE-C18"]
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertEqual(result["confirmation_reference"], "OFFLINE-C17")
+        self.assertEqual(self.form.clicks, 1)
+
     def test_superficie_cli_requires_consistent_location_on_card_and_linked_details(self):
         args = self.superficie_args() + ("--confirm",)
         card = ("November 21, 2026\nPSC-17\nBuilding: NEWTON\nFloor: Parking Superficie C\n"
@@ -834,10 +883,12 @@ class ParkingCommandTests(unittest.TestCase):
         parenthesized = card + "\nNEWTON (Parking Torres Quevedo)"
         reverse_pair = card + "\nParking Superficie C (OTHER BUILDING)"
         scheduled_pair = card + "\nschedule 07:00–23:00 NEWTON (Parking Torres Quevedo)"
+        labeled_pair = card + "\nSchedule: 07:00–23:00 NEWTON (Parking Torres Quevedo)"
         for record, details in ((card, conflicting), (conflicting, card), (card, conflicting_tail),
                                 (card, standalone), (standalone, card), (card, parenthesized),
                                 (parenthesized, card), (card, reverse_pair), (reverse_pair, card),
-                                (card, scheduled_pair), (scheduled_pair, card)):
+                                (card, scheduled_pair), (scheduled_pair, card),
+                                (card, labeled_pair), (labeled_pair, card)):
             with self.subTest(record=record, details=details):
                 self.form.after_submit = [record]
                 self.form.details = details
@@ -848,7 +899,7 @@ class ParkingCommandTests(unittest.TestCase):
                                 observation={"book": refusal})
         self.assertEqual(result["outcome"], "unknown")
         self.form.after_submit = [card + "\nNEWTON (Parking Superficie C)"]
-        self.form.details = "PSC-17\nschedule 07:00–23:00 Parking Superficie C (NEWTON)"
+        self.form.details = "PSC-17\nSchedule: 07:00–23:00 Parking Superficie C (NEWTON)"
         self.assertEqual(self.run_command(*args)["outcome"], "confirmed")
         self.assertEqual(self.form.clicks, 1)
 

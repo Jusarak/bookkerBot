@@ -325,6 +325,12 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
 def reservation_remaining(records, details, form, base_url, day):
     reference = details.get("confirmation_reference")
     if reference:
+        for record in records:
+            if reference in booking_references(record):
+                shown_days = dates(record, form.day_first)
+                if shown_days and shown_days != {day}:
+                    raise BookingProblem("Reloaded Bookings showed the saved reference with a different date.",
+                                         CANCEL_CHECK)
         by_reference = CancelTarget(details["date"], None, None, None, reference)
         if find_reservation(records, by_reference, form, base_url, day):
             return True
