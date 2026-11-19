@@ -1,0 +1,13 @@
+[Unit]
+Description=Private loopback socket for Bookker phone renewal
+Requires=nftables.service
+After=nftables.service
+ConditionPathExists=/etc/nftables.d/bookker-renewal.nft
+
+[Socket]
+ListenStream=127.0.0.1:8765
+ExecStartPre=/usr/sbin/nft -f /etc/nftables.d/bookker-renewal.nft
+Accept=no
+
+[Install]
+WantedBy=sockets.target

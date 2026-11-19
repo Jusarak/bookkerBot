@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Renew Bookker sign-in</title>
+  <style>
+    body { background: #f4f6f9; color: #172336; font: 1rem system-ui, sans-serif; margin: 0; }
+    main { box-sizing: border-box; margin: 0 auto; max-width: 29rem; padding: 1rem; }
+    h1 { font-size: 1.55rem; margin: .25rem 0 1rem; }
+    button, input { border: 1px solid #718096; border-radius: .4rem; box-sizing: border-box;
+      font: inherit; min-height: 2.75rem; padding: .45rem .7rem; }
+    button { background: white; color: inherit; }
+    button.primary { background: #123e73; border-color: #123e73; color: white; }
+    .actions { display: flex; flex-wrap: wrap; gap: .45rem; margin: .7rem 0; }
+    img { display: block; margin: .5rem auto; max-width: 100%; max-height: 70svh; width: auto; height: auto;
+      background: white; border: 1px solid #718096; touch-action: none; user-select: none; }
+    img[hidden] { display: none; }
+    input { flex: 1; min-width: 9rem; }
+    p { line-height: 1.45; }
+  </style>
+  <script src="/ui.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Renew Bookker sign-in</h1>
+    <p id="status" role="status">Checking renewal status…</p>
+    <p id="error" role="alert" hidden></p>
+    <button type="button" id="start" class="primary" hidden>Start sign-in</button>
+    <section id="viewer" aria-label="Remote Bookker browser" hidden>
+      <p>Tap a field on the screen below, then use the text box to type into it. Swipe the screen to scroll.</p>
+      <img id="frame" width="420" height="690" alt="Bookker sign-in screen" draggable="false" hidden>
+      <label for="text">Type into the selected Bookker field</label>
+      <div class="actions">
+        <input type="password" id="text" autocomplete="off" autocapitalize="none" spellcheck="false">
+        <button type="button" id="type">Type</button>
+      </div>
+      <div class="actions">
+        <button type="button" data-key="Backspace">Backspace</button>
+        <button type="button" data-key="Tab">Tab</button>
+        <button type="button" data-key="Enter">Enter</button>
+      </div>
+      <button type="button" id="finish" class="primary">Verify and save</button>
+    </section>
+    <button type="button" id="cancel" hidden>Cancel</button>
+  </main>
+</body>
+</html>

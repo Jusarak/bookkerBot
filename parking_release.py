@@ -10,6 +10,7 @@ from pathlib import Path
 
 from bookker_bot import BookkerClient
 from parking_booking import ReleaseClosed, book_parking
+from parking_notify import RenewalMail, alert_expiry, session_generation
 from parking_schedule import EXAMPLE, PRODUCTION, WARMUP, ZONE, render_timer
 
 
@@ -91,7 +92,9 @@ def run_release(schedule, clock, state, make_client, emit, *, dry_run):
             except BlockingIOError:
                 window.note("exit", outcome="competing", reason="A worker already owns this target date.")
                 return "competing"
-            client = make_client(state / "session.json")
+            session = state / "session.json"
+            generation = session_generation(session)
+            client = make_client(session)
             try:
                 result = book_parking(
                     client, building=schedule.building, floor=schedule.floor, from_date=None,
@@ -107,6 +110,12 @@ def run_release(schedule, clock, state, make_client, emit, *, dry_run):
             if result.get("dry_run"):
                 status = "preview"
             message = result.get("reason", "Reloaded Bookings verified the reservation.")
+            if status == "auth_required" and not dry_run:
+                try:
+                    notice = alert_expiry(session, generation, occurrence, RenewalMail)
+                except OSError:
+                    notice = "state_error"
+                window.note("expiry_alert", outcome=notice)
     except Exception:
         status, message = "error", "The worker could not access its local state or browser runtime."
     window.note("exit", outcome=status, reason=message)
@@ -126,6 +135,7 @@ def main(argv=None):
     run.add_argument("--dry-run", action="store_true", help="Verify the final selection without submitting")
     timer = commands.add_parser("timer", help="Render a systemd calendar timer")
     timer.add_argument("--example", action="store_true", help="Render a sample timer for offline inspection")
+    commands.add_parser("notification-test", help="Send a test email without opening Bookker")
     args = parser.parse_args(argv)
 
     if args.command == "timer":
@@ -133,6 +143,15 @@ def main(argv=None):
             print(render_timer(EXAMPLE if args.example else PRODUCTION), end="")
         except ValueError as error:
             parser.error(str(error))
+        return 0
+    if args.command == "notification-test":
+        try:
+            mailer = RenewalMail()
+            mailer.send(mailer.message())
+        except Exception:
+            journal({"event": "notification_test", "outcome": "delivery_unverified"})
+            return 1
+        journal({"event": "notification_test", "outcome": "sent"})
         return 0
     status = run_release(PRODUCTION, WallClock(), args.state_dir, make_bookker_client, journal, dry_run=args.dry_run)
     return int(status in {"error", "uncertain"})

@@ -11,9 +11,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import parking_release
-from parking_booking import SIGN_IN, BookingProblem, ParkingForm, read_intent
+from parking_booking import BOOKING_LOADING, READY_BUTTON, SIGN_IN, BookingProblem, ParkingForm, read_intent
 from parking_schedule import EXAMPLE, PRODUCTION, Schedule, ZONE
-from test_parking_booking import MATCH, OfflineForm
+from test_parking_booking import MATCH, OfflineForm, locator
 
 
 class FixtureClock:
@@ -46,7 +46,8 @@ class ReleaseForm(OfflineForm):
             raise BookingProblem("Bookker requires sign-in.", SIGN_IN)
         self.fixture.clock.advance(1)
 
-    def open(self, building, floor, vehicle):
+    def open(self, building, floor, vehicle, *, release_ready=False):
+        assert release_ready == self.page.reload.called
         self.events.append("form")
         self.fixture.clock.advance(self.fixture.prep_seconds)
         return super().open(building, floor, vehicle)
@@ -61,8 +62,8 @@ class ReleaseForm(OfflineForm):
         self.fixture.clock.advance(0.008)
         return super().next_date(earliest, exact=exact)
 
-    def whole_day(self, expected_shifts, *, verify_all=False):
-        assert verify_all and not expected_shifts
+    def whole_day(self, expected_shifts, *, verify_all=False, release_ready=False):
+        assert verify_all and release_ready and not expected_shifts
         self.fixture.clock.advance(0.015)
         return self.span, False
 
@@ -75,8 +76,9 @@ class ReleaseForm(OfflineForm):
             return None
         return super().select_space(building, floor, span, spot_name, spot_id, require_material=require_material)
 
-    def review(self, day, span, all_day, building, floor, choice, vehicle, *, verify_all=False):
-        assert verify_all
+    def review(self, day, span, all_day, building, floor, choice, vehicle, *, verify_all=False,
+               release_ready=False):
+        assert verify_all and release_ready
         self.events.append("review")
         self.fixture.clock.advance(self.fixture.review_seconds)
         self.fixture.review_at = self.fixture.clock.now()
@@ -95,6 +97,134 @@ class ReleaseForm(OfflineForm):
             self.after_submit = [self.fixture.confirmed_record]
         else:
             raise TimeoutError("private fixture browser error")
+
+
+class ReleaseControls(ReleaseForm, ParkingForm):
+    """Bookker locator doubles with readiness times and the production form methods."""
+
+    next_date = ParkingForm.next_date
+    check_date = ParkingForm.check_date
+    whole_day = ParkingForm.whole_day
+    select_space = ParkingForm.select_space
+
+    def __init__(self, testcase, page):
+        super().__init__(testcase, page)
+        self.date_input = locator()
+        self.date_input.first = self.date_input
+        self.date_input.locator.return_value = self.date_input
+        self.date_input.fill.side_effect = self.set_date
+        self.day = None
+        self.selected = set()
+        self.submitted_search = False
+        self.empty = locator(0)
+        self.empty.all.return_value = []
+        self.label = Mock(return_value=self.empty)
+        self.search = locator()
+        self.search.first = self.search
+        self.search.press.side_effect = self.dispatch_search
+        self.day_loader = locator()
+        self.day_loader.first = self.day_loader
+        self.day_loader.wait_for.side_effect = self.shifts_loaded
+        self.shifts = locator()
+        self.shifts.first = self.shifts
+        self.shifts.all.side_effect = self.available_shifts
+        self.shifts_loaded_at = None
+        self.rows = locator()
+        self.rows.first = self.rows
+        self.rows.wait_for.side_effect = self.results_loaded
+        self.rows.all.side_effect = self.available_rows
+        self.list_button = locator(0)
+        self.list_button.first = self.list_button
+        self.list_button.or_.side_effect = lambda other: other if other is self.rows else self.list_button
+        self.list_button.wait_for.side_effect = self.results_loaded
+        self.dialog = locator(text=MATCH.replace("November 23", "November 30") + "Book")
+        self.dialog.last = self.dialog
+        self.submit = locator()
+        self.submit.first = self.submit
+        self.submit.wait_for.side_effect = self.submit_ready
+        self.submit.click.side_effect = self.click
+        self.dialog.get_by_role.return_value = self.submit
+        row = locator(text="Space: PTQ-123\nAvailable\n07:00–23:00")
+        self.choose = locator()
+        row.get_by_role.return_value = self.choose
+        self.choose.click.side_effect = lambda: self.events.append("resource")
+        self.row = row
+        self.empty.or_.side_effect = lambda other: other if other is self.rows else self.empty
+        page.locator.side_effect = {
+            "input[type=date]": locator(), "mat-calendar": locator(0), "mat-chip-option": self.shifts,
+            BOOKING_LOADING: self.day_loader,
+            ":not(mat-chip-option *)": locator(), READY_BUTTON: locator(),
+            "button": locator(0), "tbody tr, mat-list-option": self.rows,
+            "app-resources article.list-container mat-list-item": self.empty,
+            "mat-dialog-container, ion-modal": self.dialog,
+        }.__getitem__
+        page.get_by_role.side_effect = self.role
+        page.wait_for_load_state.side_effect = lambda *args, **kwargs: testcase.fail("Post-release network idle")
+
+    def role(self, role, name=None):
+        if role == "dialog":
+            return self.dialog
+        if role == "button" and name.search("Search parking spaces"):
+            return self.search
+        if role == "button" and name.search("Show list"):
+            return self.list_button
+        return self.empty
+
+    def control(self, label):
+        assert label == "Date"
+        return self.date_input
+
+    def value(self, control, label):
+        assert control is self.date_input and label == "Date"
+        return self.day.isoformat()
+
+    def set_date(self, value):
+        assert self.fixture.clock.now() == self.fixture.occurrence.release
+        self.day = date.fromisoformat(value)
+        assert self.day == self.fixture.occurrence.target
+        self.events.append("date")
+        self.fixture.clock.advance(0.008)
+
+    def shifts_loaded(self, **kwargs):
+        assert self.day is not None
+        self.fixture.clock.advance(0.010)
+        self.shifts_loaded_at = self.fixture.clock.now()
+
+    def available_shifts(self):
+        assert self.shifts_loaded_at is not None
+        controls = []
+        for interval in ("07:00–14:00", "14:00–23:00"):
+            shift = locator(text=interval)
+            shift.locator.return_value = self.empty
+            shift.evaluate.side_effect = lambda script, interval=interval: interval in self.selected
+            shift.click.side_effect = lambda interval=interval: self.selected.add(interval)
+            controls.append(shift)
+        return controls
+
+    def dispatch_search(self, key, *, timeout):
+        assert key == "Enter" and self.selected == {"07:00–14:00", "14:00–23:00"}
+        self.events.append("search")
+        self.submitted_search = True
+
+    def results_loaded(self, **kwargs):
+        assert self.submitted_search
+        if "results" not in self.events:
+            self.events.append("results")
+            self.fixture.clock.advance(0.035)
+
+    def available_rows(self):
+        assert "results" in self.events
+        return [self.row]
+
+    def submit_ready(self, **kwargs):
+        assert "resource" in self.events
+        self.fixture.clock.advance(0.007)
+        self.fixture.review_at = self.fixture.clock.now()
+
+    def review(self, *args, **kwargs):
+        self.selection, submit = ParkingForm.review(self, *args, **kwargs)
+        self.events.append("review")
+        return self.selection, submit
 
 
 class ScheduleTests(unittest.TestCase):
@@ -161,7 +291,7 @@ class ScheduledEntryPointTests(unittest.TestCase):
         self.prep_seconds = 2
         self.review_seconds = 0
 
-    def run_entry(self, *args, schedule=EXAMPLE, during_launch=None):
+    def run_entry(self, *args, schedule=EXAMPLE, during_launch=None, notifications=False):
         stdout = io.StringIO()
 
         def launch(client, *, storage_state, timezone_id):
@@ -174,7 +304,10 @@ class ScheduledEntryPointTests(unittest.TestCase):
                 during_launch()
 
         browser, context = Mock(), Mock()
+        mail = contextlib.nullcontext() if notifications else patch.object(parking_release, "RenewalMail",
+                                                                           side_effect=KeyError)
         with (
+            mail,
             patch.object(parking_release, "PRODUCTION", schedule),
             patch.object(parking_release, "WallClock", return_value=self.clock),
             patch("parking_booking.ParkingForm", return_value=self.form) as form,
@@ -211,6 +344,23 @@ class ScheduledEntryPointTests(unittest.TestCase):
 
     def fixture_time(self, trace, event):
         return datetime.fromisoformat(next(row["at"] for row in trace if row["event"] == event))
+
+    def test_scheduled_form_submits_at_first_verified_control(self):
+        self.form = ReleaseControls(self, self.page)
+        code, trace = self.run_entry()
+        self.assertEqual(code, 0)
+        self.assertEqual(trace[-1]["outcome"], "confirmed")
+        self.assertEqual(self.form.events, ["auth", "read", "form", "date", "search", "results", "resource",
+                                            "review", "book", "observe", "reload"])
+        self.assertEqual(self.clock.sleeps, [57])
+        self.assertEqual(self.fixture_time(trace, "submit_dispatch"), self.review_at)
+        self.assertEqual({row["event"]: row["offset_ms"] for row in trace},
+                         {"wake": -60000, "prepared": -57000, "release_open": 0, "date_dispatch": 0,
+                          "refresh_dispatch": 18, "submit_dispatch": 60, "confirmation_observed": 80, "exit": 80})
+        self.page.wait_for_load_state.assert_not_called()
+        if os.environ.get("BOOKKER_OFFLINE_TRACE") == "1":
+            for row in trace:
+                print(json.dumps(row))
 
     def test_late_start_and_preparation_overrun(self):
         self.clock.at = self.occurrence.release + timedelta(seconds=55)
@@ -259,7 +409,7 @@ class ScheduledEntryPointTests(unittest.TestCase):
     def test_stale_calendar_reopens_once_and_unavailable_space_exits(self):
         self.stale_form = self.unavailable = True
         _, trace = self.run_entry()
-        self.page.reload.assert_called_once_with(wait_until="domcontentloaded", timeout=10_000)
+        self.page.reload.assert_called_once_with(wait_until="domcontentloaded", timeout=5000)
         self.assertEqual(self.form.events.count("search"), 1)
         self.assertEqual(trace[-1]["outcome"], "unavailable")
         self.assertFalse(self.intent.exists())
@@ -299,6 +449,10 @@ class ScheduledEntryPointTests(unittest.TestCase):
         self.assertTrue(next(row for row in trace if row["event"] == "confirmation_observed")["reconciled"])
         self.assertEqual(self.form.clicks, 1)
         self.assertEqual(self.intent.read_bytes(), intent)
+        if os.environ.get("BOOKKER_OFFLINE_TRACE") == "1":
+            print(competing.getvalue(), end="")
+            for row in trace:
+                print(json.dumps(row))
 
     def test_external_idp_redirect_is_auth_required(self):
         form = ParkingForm(Mock(url="https://login.example.test/sso"))

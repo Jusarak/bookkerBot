@@ -1,0 +1,12 @@
+# Only root (tailscaled) may connect directly and supply the Serve identity header.
+destroy table inet bookker_renewal
+table inet bookker_renewal {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        ip daddr 127.0.0.1 tcp dport 8765 iifname != "lo" drop
+    }
+    chain output {
+        type filter hook output priority filter; policy accept;
+        ip daddr 127.0.0.1 tcp dport 8765 meta skuid != 0 reject with tcp reset
+    }
+}

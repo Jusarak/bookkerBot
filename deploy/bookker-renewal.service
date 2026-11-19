@@ -1,0 +1,34 @@
+[Unit]
+Description=Bookker phone session renewal
+Documentation=file:/home/marcos/workspace/code/bookkerBot/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=marcos
+Group=marcos
+WorkingDirectory=/home/marcos/workspace/code/bookkerBot
+EnvironmentFile=/etc/bookker-renewal.env
+ExecStart=/home/marcos/workspace/code/bookkerBot/.venv/bin/python -B parking_renewal.py
+StateDirectory=bookker-parking
+StateDirectoryMode=0700
+UMask=0077
+RuntimeMaxSec=15min
+TimeoutStopSec=6s
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bookker-renewal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+AmbientCapabilities=
