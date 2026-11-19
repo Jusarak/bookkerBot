@@ -15,10 +15,10 @@ from zoneinfo import ZoneInfo
 
 import run_bookker
 from parking_booking import (
-    BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, FINAL_ATTEMPT, NO_BOOKINGS, RETRY_ATTEMPT,
+    BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, FINAL_ATTEMPT, INACTIVE, NO_BOOKINGS, RETRY_ATTEMPT,
     RETRY_FINAL_ATTEMPT, RETRY_PERMISSION, SUPERFICIE_SATURDAY_SHIFTS, TORRES_SHIFTS, BookingProblem,
-    MissingBookingDetailsLink, ParkingForm, Selection, SpaceChoice, dates, intervals, parking_dates, period_covers,
-    read_intent, verify_booking, write_json,
+    MissingBookingDetailsLink, ParkingForm, Selection, SpaceChoice, booking_statuses, dates, intervals,
+    parking_dates, period_covers, read_intent, verify_booking, write_json,
 )
 
 
@@ -195,10 +195,16 @@ class CancellationFixture:
         self.delete.click.side_effect = self.remove
         self.final_delete.click.side_effect = self.remove
 
-    def bookings(self, base_url, day, *, reload):
+    def bookings(self, base_url, day, *, reload, include_inactive=False):
         assert reload
         self.reads.append(day)
-        return self.records.copy()
+        if include_inactive:
+            return self.records.copy()
+        return [
+            record for record in self.records
+            if not (statuses := booking_statuses(record))
+            or not all(INACTIVE.fullmatch(status) for status in statuses)
+        ]
 
     def booking_row(self, base_url, day, record):
         assert record in self.records
@@ -464,10 +470,10 @@ class CancellationCommandTests(unittest.TestCase):
         form = ParkingForm(page)
         reads = self.form.bookings
 
-        def bookings(base_url, day, *, reload):
+        def bookings(base_url, day, *, reload, include_inactive=False):
             if self.form.target in self.form.records:
-                return reads(base_url, day, reload=reload)
-            return form.bookings(base_url, day, reload=reload)
+                return reads(base_url, day, reload=reload, include_inactive=include_inactive)
+            return form.bookings(base_url, day, reload=reload, include_inactive=include_inactive)
 
         args = (*self.selector, "--confirm", "--submission-state", str(self.state))
         with (patch.object(self.form, "bookings", side_effect=bookings),
@@ -497,6 +503,46 @@ class CancellationCommandTests(unittest.TestCase):
         self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
         self.assertEqual(self.form.records, [self.form.neighbor])
         self.assertEqual(self.form.reads, [None, date(2026, 11, 26)])
+        self.form.delete.click.assert_called_once()
+
+    def test_cancel_retry_distinguishes_inactive_statuses_from_cancellation(self):
+        args = ("--reference", "OFFLINE-123", *EXACT_ARGS, "--confirm", "--submission-state", str(self.state))
+        self.form.delete.click.side_effect = TimeoutError()
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(self.form.records, [self.form.target, self.form.neighbor])
+
+        for status in ("Expired", "Rejected", "Rejected\nCancelled"):
+            with self.subTest(status=status):
+                row = self.form.target.replace("Status: Confirmed", f"Status: {status}")
+                self.form.records[0] = row
+                result = self.run_command(*args)
+                self.assertEqual(result["outcome"], "unknown")
+                self.assertIn("still present", result["reason"])
+                self.assertEqual(self.form.records, [row, self.form.neighbor])
+
+        cancelled = self.form.target.replace("Status: Confirmed", "Status: Cancelled")
+        self.form.records[0] = cancelled.replace("PTQ-123", "PTQ-125")
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.form.records[0] = cancelled
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "cancelled")
+        self.assertIn("marked as cancelled", result["reason"])
+        self.assertEqual(self.form.records, [cancelled, self.form.neighbor])
+        self.form.trigger.click.assert_called_once()
+        self.form.delete.click.assert_called_once()
+
+    def test_cancel_accepts_explicit_cancellation_on_initial_location_readback(self):
+        target = self.form.target.replace("\nConfirmation reference: OFFLINE-123", "")
+        self.form.target = self.form.records[0] = target
+        self.form.row.inner_text.return_value = target
+        cancelled = target.replace("Status: Confirmed", "Status: Canceled")
+        self.form.delete.click.side_effect = lambda **kwargs: self.form.records.__setitem__(0, cancelled)
+        args = (*self.selector, "--confirm", "--submission-state", str(self.state))
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "cancelled")
+        self.assertIn("marked as cancelled", result["reason"])
+        self.assertEqual(self.form.records, [cancelled, self.form.neighbor])
         self.form.delete.click.assert_called_once()
 
     def test_cancel_by_location_checks_saved_reference_on_readback_and_retry(self):

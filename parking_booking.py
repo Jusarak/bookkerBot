@@ -103,7 +103,8 @@ BOOKING_LIST_ROWS = (
 )
 BOOKING_LOADING = "[aria-busy=true], [role=progressbar], mat-spinner, mat-progress-spinner"
 CONFIRMED_STATUS = re.compile(r"confirmed|booked|reserved|approved|confirmad[ao]|reservad[ao]|aprobad[ao]", re.I)
-INACTIVE = re.compile(r"cancelled|canceled|expired|rejected|rechazad[ao]|cancelad[ao]|caducad[ao]", re.I)
+CANCELLED_STATUS = re.compile(r"cancelled|canceled|cancelad[ao]", re.I)
+INACTIVE = re.compile(rf"{CANCELLED_STATUS.pattern}|expired|rejected|rechazad[ao]|caducad[ao]", re.I)
 UNVERIFIED_STATUS = re.compile(r"(?:(?:booking|reservation) (?:is )?)?pending(?: approval| confirmation)?|"
                                r"requested|pendiente(?: de aprobación| de confirmación)?", re.I)
 FAILED_STATUS = re.compile(r"(?:(?:booking|reservation) (?:has )?)?(?:failed|declined|error)|"

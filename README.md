@@ -60,9 +60,11 @@ single-occurrence action or choice.
 Reuse that intent path after an interruption. A rerun checks for removal in a
 reloaded Bookings period that covers the saved date. Verification uses the saved
 reference when available and checks the original location and space if the
-reference is absent. The result stays uncertain if the period cannot be verified,
-either lookup still finds the reservation, or the saved reference appears with a
-different date.
+reference is absent. It includes inactive rows and verifies cancellation when
+the exact reservation is absent or explicitly marked cancelled. The result
+stays uncertain if the period cannot be verified, the reservation remains
+visible with another status such as Expired or Rejected, or the saved reference
+appears with a different date.
 
 ## Offline verification
 

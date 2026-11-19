@@ -6,9 +6,10 @@ from dataclasses import asdict, dataclass
 from datetime import date
 
 from parking_booking import (
-    LOCATION_FIELD, MADRID, PARKING_TYPE, SIGN_IN, SPACE_CODE, SPACE_FIELD,
-    BookingProblem, MissingBookingDetailsLink, ParkingForm, booking_references, card_locations, dates, displayed_spaces,
-    field_values, intervals, location_pair_names, normalized, outcome, shift_span, shows_location, visible, write_json,
+    CANCELLED_STATUS, LOCATION_FIELD, MADRID, PARKING_TYPE, SIGN_IN, SPACE_CODE, SPACE_FIELD,
+    BookingProblem, MissingBookingDetailsLink, ParkingForm, booking_references, booking_statuses, card_locations,
+    dates, displayed_spaces, field_values, intervals, location_pair_names, normalized, outcome, shift_span,
+    shows_location, visible, write_json,
 )
 
 CANCEL_CHECK = "Check the selected reservation in Bookker Bookings."
@@ -33,6 +34,14 @@ class CancelTarget:
     floor: str | None
     space: str | None
     reference: str | None
+
+
+@dataclass(frozen=True)
+class ReservationMatch:
+    record: str
+    details: dict
+    recurring: bool
+    explicitly_cancelled: bool
 
 
 def booking_location(text):
@@ -72,10 +81,9 @@ def find_reservation(records, target, form, base_url, day):
                 shown = booking_location(record)
                 if shown and shows_location(record, *shown):
                     continue
-        resolved = reservation_details(record, target, location, form, base_url, day)
-        if resolved is not None:
-            details, recurring = resolved
-            matches.append((record, details, recurring))
+        match = reservation_details(record, target, location, form, base_url, day)
+        if match is not None:
+            matches.append(match)
             if len(matches) > 1:
                 raise BookingProblem("More than one Bookings row matched the cancellation selector.", CANCEL_CHECK)
     return matches[0] if matches else None
@@ -169,7 +177,9 @@ def reservation_details(record, target, requested_location, form, base_url, day)
         details.update(start_time=hours[0][0], end_time=hours[-1][1],
                        displayed_intervals=[list(span) for span in hours])
     recurrence = re.sub(r"(?im)^\s*(?:no repeat|repeat\s*:\s*none|sin repetición)\s*$", "", text)
-    return details, bool(RECURRING.search(recurrence))
+    statuses = booking_statuses(text)
+    explicitly_cancelled = bool(statuses) and all(CANCELLED_STATUS.fullmatch(status) for status in statuses)
+    return ReservationMatch(record, details, bool(RECURRING.search(recurrence)), explicitly_cancelled)
 
 
 def cancellation_action(form, row, record, *, recurring):
@@ -260,6 +270,15 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
     def result(status, reason):
         return {**outcome(status, reason, CANCEL_CHECK), **details}
 
+    def reconcile(day, present_reason):
+        records = form.bookings(base_url, day, reload=True, include_inactive=True)
+        readback = cancellation_readback(records, details, form, base_url, day)
+        if readback == "cancelled":
+            return result("cancelled", "The selected reservation was marked as cancelled in reloaded Bookings.")
+        if readback == "absent":
+            return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
+        return result("unknown", present_reason)
+
     try:
         day = date.fromisoformat(target.date) if target.date else None
         if state is not None:
@@ -278,24 +297,24 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
         client.open_with_session(timezone_id=MADRID)
         form = ParkingForm(client.page)
         base_url = client.base_url
-        records = form.bookings(base_url, day, reload=True)
         if attempted:
-            if reservation_remaining(records, details, form, base_url, day):
-                return result("unknown", "A cancellation intent already exists and the reservation is still present.")
-            return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
+            return reconcile(day, "A cancellation intent already exists and the reservation is still present.")
 
+        records = form.bookings(base_url, day, reload=True)
         selected = find_reservation(records, target, form, base_url, day)
         if selected is None:
             return result("absent", "No parking reservation matched in reloaded Bookings.")
 
-        row_text, details, recurring = selected
+        details = selected.details
         if not confirm:
             return {**result("preview", "One parking reservation matched."), "dry_run": True}
         if state is None:
             return result("blocked", "Cancellation requires a persistent submission state path.")
         show_preview(details)
-        row = form.booking_row(base_url, day, row_text)
-        action, dialogs, needs_occurrence_choice = cancellation_action(form, row, row_text, recurring=recurring)
+        row = form.booking_row(base_url, day, selected.record)
+        action, dialogs, needs_occurrence_choice = cancellation_action(
+            form, row, selected.record, recurring=selected.recurring
+        )
         try:
             write_json(state, {"version": 1, "action": "cancel-one-occurrence", "target": asdict(target),
                                "reservation": details}, exclusive=True)
@@ -313,10 +332,7 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
         except Exception:
             action_error = "The Bookker cancellation action could not be verified."
         day = date.fromisoformat(details["date"])
-        records = form.bookings(base_url, day, reload=True)
-        if not reservation_remaining(records, details, form, base_url, day):
-            return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
-        return result("unknown", action_error or "The selected reservation is still present in reloaded Bookings.")
+        return reconcile(day, action_error or "The selected reservation is still present in reloaded Bookings.")
     except BookingProblem as error:
         return {**result("unknown" if attempted else "blocked", error.reason), "next_action": error.next_action}
     except FileNotFoundError:
@@ -329,10 +345,11 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
         return result("unknown" if attempted else "blocked", "The Bookker Bookings operation could not be verified.")
 
 
-def reservation_remaining(records, details, form, base_url, day):
+def cancellation_readback(records, details, form, base_url, day):
     reference = details.get("confirmation_reference")
     location = details["building"], details["floor"]
     space = details["space"]
+    match = None
     if reference:
         saved_location = f"Building: {location[0]}\nFloor: {location[1]}"
         for record in records:
@@ -354,7 +371,15 @@ def reservation_remaining(records, details, form, base_url, day):
                 raise BookingProblem("Reloaded Bookings showed the saved reference with a different date.",
                                      CANCEL_CHECK)
         by_reference = CancelTarget(details["date"], None, None, None, reference)
-        if find_reservation(records, by_reference, form, base_url, day):
-            return True
-    by_location = CancelTarget(details["date"], *location, space, None)
-    return find_reservation(records, by_location, form, base_url, day) is not None
+        match = find_reservation(records, by_reference, form, base_url, day)
+    if match is None:
+        by_location = CancelTarget(details["date"], *location, space, None)
+        match = find_reservation(records, by_location, form, base_url, day)
+    if match is None:
+        return "absent"
+    identity_fields = ("building", "floor", "space")
+    if (match.explicitly_cancelled
+            and all(normalized(match.details[key]) == normalized(details[key]) for key in identity_fields)
+            and (not reference or match.details.get("confirmation_reference") in (None, reference))):
+        return "cancelled"
+    return "present"
