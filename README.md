@@ -26,6 +26,8 @@ on this floor, the CLI checks the shifts displayed for the requested date. It
 checks existing parking bookings and requires a named space for the full
 interval. Reuse the same intent path if the result is uncertain. The CLI reloads
 Bookings and checks the original reservation before reporting the outcome.
+For Superficie C, confirmation requires matching details linked from the
+reloaded card, including when the card itself shows a confirmed status.
 
 ## Cancel one reservation
 
@@ -50,9 +52,12 @@ python3 run_bookker.py cancel --on-date 2026-11-26 --building NEWTON \
   --submission-state cancellation.intent.json
 ```
 
-Reuse that intent path after an interruption. A rerun checks for removal in
-reloaded Bookings. If the selector still matches, the CLI reports an uncertain
-result and leaves the row in place.
+The CLI reads linked details when a possible match omits identifying fields.
+Recurring rows require an explicit single-occurrence action or choice.
+
+Reuse that intent path after an interruption. A rerun checks for removal in a
+reloaded Bookings period that covers the saved date. The result stays uncertain
+if that coverage cannot be verified or the selector still matches.
 
 ## Offline verification
 

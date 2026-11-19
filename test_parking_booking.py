@@ -166,6 +166,8 @@ class CancellationFixture:
         self.neighbor = self.target.replace("PTQ-123", "PTQ-124").replace("OFFLINE-123", "OFFLINE-124")
         self.records = [self.target, self.neighbor]
         self.reads = []
+        self.linked = {}
+        self.detail_reads = []
         self.page = Mock()
         self.row = locator(text=self.target)
         self.trigger = locator()
@@ -196,6 +198,12 @@ class CancellationFixture:
     def booking_row(self, base_url, day, record):
         assert record == self.target
         return self.row
+
+    def booking_details(self, base_url, day, record, space):
+        self.detail_reads.append(record)
+        if record not in self.linked:
+            raise BookingProblem("The matching Bookings row did not expose one booking details link.")
+        return self.linked[record]
 
     def settled(self):
         pass
@@ -239,12 +247,15 @@ class CancellationCommandTests(unittest.TestCase):
         return json.loads(self.stdout.getvalue())
 
     def test_preview_and_confirm_single_occurrence_leave_neighbor(self):
+        self.form.target = self.form.records[0] = self.form.target + "\nRecurring series"
+        self.form.row.inner_text.return_value = self.form.target
         result = self.run_command(*self.selector)
         self.assertEqual(result["outcome"], "preview")
         self.assertEqual(result["confirmation_reference"], "OFFLINE-123")
         self.form.trigger.click.assert_not_called()
         self.assertFalse(self.state.exists())
         self.form.prompt("Delete booking?\nRecurring series\nOnly this occurrence\nDelete")
+        self.form.delete.get_attribute.return_value = "dialog"
         self.form.radio.count.return_value = 1
         self.form.radio.is_checked.side_effect = [False, True]
 
@@ -260,6 +271,84 @@ class CancellationCommandTests(unittest.TestCase):
         self.assertEqual(self.form.reads, [date(2026, 11, 26)] * 3)
         self.form.radio.check.assert_called_once()
         self.form.final_delete.click.assert_called_once()
+
+    def test_recurring_row_cannot_use_generic_dialog_confirmation(self):
+        self.form.target = self.form.records[0] = self.form.target + "\nRecurring series"
+        self.form.row.inner_text.return_value = self.form.target
+        self.form.delete.get_attribute.return_value = "dialog"
+        self.form.prompt("Delete booking?\nDelete")
+        args = (*self.selector, "--confirm", "--submission-state", str(self.state))
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertIn("one occurrence", result["reason"])
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.assertEqual(self.form.records, [self.form.target, self.form.neighbor])
+        self.form.delete.click.assert_called_once()
+        self.form.final_delete.click.assert_not_called()
+
+    def test_sparse_row_resolves_for_preview_and_cancellation_readback(self):
+        sparse = "November 26, 2026\nSpace: PTQ-123\nReference: OFFLINE-123"
+        linked = "Building\nNEWTON, Parking Torres Quevedo\n07:00–23:00"
+        self.form.records[0] = self.form.target = sparse
+        self.form.row.inner_text.return_value = sparse
+        self.form.linked[sparse] = linked
+        for selector in (self.selector, ("--reference", "OFFLINE-123")):
+            with self.subTest(selector=selector):
+                result = self.run_command(*selector)
+                self.assertEqual(result["outcome"], "preview")
+                self.assertEqual((result["date"], result["building"], result["floor"], result["space"]),
+                                 ("2026-11-26", "NEWTON", "Parking Torres Quevedo", "PTQ-123"))
+        self.form.trigger.click.assert_not_called()
+        # After the interrupted action, the same reservation can still be
+        # present in a card that no longer displays the reference.
+        readback = "November 26, 2026\nPTQ-123"
+        self.form.linked[readback] = linked
+        self.form.delete.click.side_effect = lambda **kwargs: self.form.records.__setitem__(0, readback)
+        args = ("--reference", "OFFLINE-123", "--confirm", "--submission-state", str(self.state))
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.assertEqual(self.form.detail_reads, [sparse, sparse, sparse, readback, readback])
+        self.form.delete.click.assert_called_once()
+        self.assertEqual(self.form.records, [readback, self.form.neighbor])
+
+    def test_sparse_location_match_still_checks_linked_ambiguity(self):
+        sparse = "November 26, 2026\nPTQ-123"
+        self.form.records.append(sparse)
+        self.form.linked[sparse] = "NEWTON, Parking Superficie C"
+        self.assertEqual(self.run_command(*self.selector)["outcome"], "preview")
+        self.form.linked[sparse] = "NEWTON, Parking Torres Quevedo"
+        self.assertIn("More than one", self.run_command(*self.selector)["reason"])
+        self.form.linked[sparse] += "\nSpace: PTQ-124"
+        self.assertIn("conflicting spaces", self.run_command(*self.selector)["reason"])
+        self.form.trigger.click.assert_not_called()
+
+    def test_elapsed_intent_cannot_use_absence_in_upcoming_bookings(self):
+        page = Mock(url="https://bookker.test/#/bookings")
+        view = page.locator.return_value.filter.return_value
+        view.count.return_value = 1
+        view.get_by_role.return_value.filter.return_value.count.return_value = 0
+        upcoming = locator()
+        form = ParkingForm(page)
+        reads = self.form.bookings
+
+        def bookings(base_url, day, *, reload):
+            if self.form.target in self.form.records:
+                return reads(base_url, day, reload=reload)
+            return form.bookings(base_url, day, reload=reload)
+
+        args = (*self.selector, "--confirm", "--submission-state", str(self.state))
+        with (patch.object(self.form, "bookings", side_effect=bookings),
+              patch.object(form, "label", return_value=upcoming),
+              patch.object(form, "check_session"),
+              patch("parking_booking.datetime") as clock):
+            clock.now.return_value = datetime(2026, 11, 27, tzinfo=ZoneInfo("Europe/Madrid"))
+            for _ in range(2):
+                result = self.run_command(*args)
+                self.assertEqual(result["outcome"], "unknown")
+                self.assertIn("period could not be verified", result["reason"])
+        self.form.delete.click.assert_called_once()
+        upcoming.click.assert_not_called()
+        self.assertEqual(self.form.records, [self.form.neighbor])
 
     def test_cancel_by_reference_reconciles_interruption_without_second_delete(self):
         args = ("--reference", "OFFLINE-123", "--confirm", "--submission-state", str(self.state))
@@ -497,6 +586,23 @@ class ParkingCommandTests(unittest.TestCase):
                                 observation={"book": refusal})
         self.assertEqual(result["outcome"], "refused")
         self.assertEqual(result["reason"], refusal)
+
+    def test_superficie_cli_corroborates_confirmed_card_with_linked_details(self):
+        args = self.superficie_args()
+        card = ("November 21, 2026\nPSC-17\n07:00–23:00\n"
+                "NEWTON, Parking Superficie C\nStatus: Confirmed\nReference: OFFLINE-C17")
+        self.form.after_submit = [card]
+        self.form.details = card.replace("Confirmed", "Failed")
+        self.assertEqual(self.run_command(*args, "--confirm")["outcome"], "unknown")
+        self.assertEqual(self.form.events[-2:], ["reload", "details"])
+        self.form.details = None
+        self.assertEqual(self.run_command(*args, "--confirm")["outcome"], "unknown")
+        self.assertEqual(self.form.events[-2:], ["reload", "details"])
+        self.form.details = card.replace("OFFLINE-C17", "OFFLINE-C18")
+        self.assertEqual(self.run_command(*args, "--confirm")["outcome"], "unknown")
+        self.form.details = card
+        self.assertEqual(self.run_command(*args, "--confirm")["outcome"], "confirmed")
+        self.assertEqual(self.form.clicks, 1)
 
     def test_exact_date_stops_at_an_existing_reservation(self):
         self.form.existing = [MATCH.replace("November 23", "November 26")]
@@ -751,6 +857,39 @@ class ParkingCommandTests(unittest.TestCase):
         period.click.assert_called_once()
         option.click.assert_called_once()
 
+    def test_bookings_requires_selected_past_tab_for_historical_results(self):
+        page = Mock(url="https://bookker.test/#/bookings")
+        view = page.locator.return_value.filter.return_value
+        view.count.return_value = 1
+        period = view.get_by_label.return_value.filter.return_value
+        period.evaluate.return_value = False
+        period.inner_text.return_value = "All past bookings"
+        history = locator()
+        history.get_attribute.return_value = "false"
+        upcoming = locator()
+        unavailable = locator(0)
+        unavailable.first = unavailable
+        view.get_by_role.side_effect = lambda role, name=None: (
+            history if role == "tab" and name.fullmatch("Past bookings") else unavailable
+        )
+        view.locator.return_value.filter.return_value.count.return_value = 0
+        view.locator.return_value.and_.return_value.filter.return_value.evaluate_all.return_value = []
+        empty = view.get_by_text.return_value.and_.return_value.filter.return_value.first
+        empty.count.return_value = 1
+        empty.inner_text.return_value = "No bookings"
+        form = ParkingForm(page)
+        day = date(2026, 11, 19)
+        with (patch("parking_booking.datetime", RunDate), patch.object(form, "check_session"),
+              patch.object(form, "label", return_value=upcoming)):
+            with self.assertRaisesRegex(BookingProblem, "period could not be verified"):
+                form.bookings("about:blank", day, reload=True)
+            history.get_attribute.return_value = "true"
+            self.assertEqual(form.bookings("about:blank", day, reload=True), [])
+            empty.inner_text.return_value = "No upcoming bookings"
+            with self.assertRaisesRegex(BookingProblem, "period could not be verified"):
+                form.bookings("about:blank", day, reload=True)
+        upcoming.click.assert_not_called()
+
     def test_bookings_card_wrapping_the_period_and_empty_state(self):
         page = Mock(url="https://bookker.test/#/bookings")
         view = page.locator.return_value.filter.return_value
@@ -954,6 +1093,13 @@ class ParkingCommandTests(unittest.TestCase):
         self.assertTrue(period_covers("Next week", day, today, False))
         self.assertTrue(period_covers("Nov 23, 2026 – Nov 29, 2026", day, today, False))
         self.assertFalse(period_covers("This week · Nov 19, 2026 – Nov 21, 2026", day, today, False))
+        elapsed = date(2026, 11, 19)
+        self.assertFalse(period_covers("All upcoming bookings", elapsed, today, False))
+        self.assertFalse(period_covers("All upcoming bookings", None, today, False))
+        self.assertTrue(period_covers("All upcoming bookings", day, today, False))
+        self.assertFalse(period_covers("All past bookings", day, today, False))
+        self.assertTrue(period_covers("All past bookings", elapsed, today, False))
+        self.assertTrue(period_covers("All bookings", None, today, False))
 
     def test_material_shift_chips_bound_the_whole_day(self):
         page = Mock()

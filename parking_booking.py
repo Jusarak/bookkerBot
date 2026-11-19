@@ -107,10 +107,19 @@ UNVERIFIED_STATUS = re.compile(r"(?:(?:booking|reservation) (?:is )?)?pending(?:
                                r"requested|pendiente(?: de aprobación| de confirmación)?", re.I)
 FAILED_STATUS = re.compile(r"(?:(?:booking|reservation) (?:has )?)?(?:failed|declined|error)|"
                            r"fallid[ao]|denegad[ao]", re.I)
-ALL_PERIOD = re.compile(r"\ball (?:time|dates|upcoming(?: bookings)?|bookings)\b|"
-                        r"\btodas las reservas\b|^(?:all|todas)$", re.I)
-PERIOD = re.compile(r"\b(?:This (?:week|month|year)|Next (?:week|month|year|\d+ days)|"
-                    r"Today|Tomorrow)\b|" + ALL_PERIOD.pattern, re.I)
+UPCOMING_BOOKINGS = r"(?:Upcoming(?: bookings)?|Próximas(?: reservas)?)"
+PAST_BOOKINGS = r"(?:Past(?: bookings)?|Booking history|Historial(?: de reservas)?|Reservas pasadas)"
+ALL_PERIOD = re.compile(r"\ball (?:time|dates|bookings)\b|\btodas las reservas\b|^(?:all|todas)$", re.I)
+UPCOMING_PERIOD = re.compile(rf"\b(?:all )?{UPCOMING_BOOKINGS}\b", re.I)
+PAST_PERIOD = re.compile(rf"\b(?:all )?{PAST_BOOKINGS}\b", re.I)
+RELATIVE_PERIOD = re.compile(
+    r"\b(?:This (?:week|month|year)|Next (?:week|month|year|\d+ days)|Today|Tomorrow)\b", re.I
+)
+PERIOD = re.compile("|".join(pattern.pattern for pattern in (
+    RELATIVE_PERIOD, ALL_PERIOD, UPCOMING_PERIOD, PAST_PERIOD,
+)), re.I)
+BOOKINGS_PERIOD_REASON = "The Bookings period could not be verified for the candidate date."
+CHECK_BOOKINGS_PERIOD = "Check the Bookings period filter for a range that includes the intended date."
 STATUS_FIELD = r"(?:Booking )?Status|Estado(?: de la reserva)?"
 SPACE_FIELD = r"Parking space|Space|Plaza|Resource|Recurso"
 REFERENCE_FIELD = (r"Reference|Confirmation(?: (?:reference|code|number|ID))?|"
@@ -296,18 +305,26 @@ def shift_span(shifts):
 
 
 def period_covers(label, day, today, day_first):
-    label = normalized(label)
-    if ALL_PERIOD.search(label):
-        return True
-    if day is None:
-        return False
+    label = re.sub(r"^(?:booking )?(?:period|date range)\s*:?\s+", "", normalized(label))
     explicit = sorted(dates(label, day_first))
+    upcoming = UPCOMING_PERIOD.search(label)
+    past = PAST_PERIOD.search(label)
+    if upcoming and (day is None or day < today):
+        return False
+    if past and (day is None or day >= today):
+        return False
+    if day is None:
+        return not explicit and bool(ALL_PERIOD.fullmatch(label))
     if len(explicit) == 2:
         return explicit[0] <= day <= explicit[1]
     if len(explicit) == 1:
         return explicit[0] == day
+    if explicit:
+        return False
+    if any(pattern.fullmatch(label) for pattern in (UPCOMING_PERIOD, PAST_PERIOD, ALL_PERIOD)):
+        return True
 
-    period = PERIOD.search(label)
+    period = RELATIVE_PERIOD.search(label)
     if not period:
         return False
     label = period[0]
@@ -1020,10 +1037,7 @@ class ParkingForm:
         def covers(label):
             return period_covers(label, day, today, day_first)
 
-        problem = BookingProblem(
-            "The Bookings period could not be verified for the candidate date.",
-            "Check the Bookings period filter for a range that includes the intended date.",
-        )
+        problem = BookingProblem(BOOKINGS_PERIOD_REASON, CHECK_BOOKINGS_PERIOD)
         try:
             period.wait_for(timeout=10_000)
             native = period.evaluate("el => el.tagName === 'SELECT'")
@@ -1080,8 +1094,23 @@ class ParkingForm:
             main = visible(self.page.get_by_role("main"))
             view = main if main.count() == 1 else self.page
 
-        upcoming = self.label(re.compile(r"^(?:Upcoming(?: bookings)?|Próximas(?: reservas)?)$", re.I), view)
-        if upcoming.count():
+        today = datetime.now(ZoneInfo(MADRID)).date()
+        upcoming = self.label(re.compile(rf"^{UPCOMING_BOOKINGS}$", re.I), view)
+        needs_history = day is None or day < today
+        if needs_history:
+            scope = visible(view.get_by_role(
+                "tab", name=re.compile(r"^(?:All bookings|Todas las reservas)$", re.I)
+            ))
+            if not scope.count() and day is not None:
+                scope = visible(view.get_by_role("tab", name=re.compile(rf"^{PAST_BOOKINGS}$", re.I)))
+            if scope.count() == 1:
+                scope.click()
+                self.settled()
+                if scope.get_attribute("aria-selected") != "true":
+                    raise BookingProblem(BOOKINGS_PERIOD_REASON, CHECK_BOOKINGS_PERIOD)
+            elif scope.count() or upcoming.count():
+                raise BookingProblem(BOOKINGS_PERIOD_REASON, CHECK_BOOKINGS_PERIOD)
+        elif upcoming.count():
             upcoming.click()
             self.settled()
         period = self.select_booking_period(day, view)
@@ -1187,6 +1216,8 @@ class ParkingForm:
                 });
             }""", explicit_rows)
             empty_text = normalized(empty.inner_text()) if empty.count() else ""
+            if needs_history and UPCOMING_PERIOD.search(empty_text):
+                raise BookingProblem(BOOKINGS_PERIOD_REASON, CHECK_BOOKINGS_PERIOD)
             layout = period_layout
             if empty_text:
                 marker = re.escape(empty_text)
@@ -1252,9 +1283,11 @@ class ParkingForm:
                        ':not([href*="/map"], [href*="/delete"])')
         action = row.get_by_role("link", name=details_name).or_(
             row.get_by_role("button", name=details_name)
-        ).or_(row.get_by_role("link", name=space, exact=True)).or_(row.locator(detail_href)).or_(
+        ).or_(row.locator(detail_href)).or_(
             row.and_(self.page.locator(detail_href))
         )
+        if space:
+            action = action.or_(row.get_by_role("link", name=space, exact=True))
         action = visible(action)
         if action.count() != 1 or not action.is_enabled(timeout=1000):
             raise BookingProblem("The matching Bookings row did not expose one booking details link.")
@@ -1363,20 +1396,21 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
     linked = False
     if has_hours(record) and not shows_interval(record, selection):
         return outcome("unknown", "The reloaded reservation showed a different or unreadable schedule.", RECONCILE)
-    if statuses:
-        if not all(CONFIRMED_STATUS.fullmatch(status) for status in statuses) or not complete(record):
-            return outcome("unknown", "The matching Bookings record showed an unconfirmed or conflicting status or schedule.",
-                           RECONCILE)
-    elif pending or refusal:
-        return outcome("unknown", refusal or PENDING_MESSAGE, RECONCILE)
-    elif base_url is None:
-        return outcome("unknown", "The matching record in reloaded Bookings did not show a confirmed status.",
+    if statuses and (any(not CONFIRMED_STATUS.fullmatch(status) for status in statuses)
+                     or (not superficie and not complete(record))):
+        return outcome("unknown", "The matching Bookings record showed an unconfirmed or conflicting status or schedule.",
                        RECONCILE)
-    else:
+    if not statuses and (pending or refusal):
+        return outcome("unknown", refusal or PENDING_MESSAGE, RECONCILE)
+    if superficie or not statuses:
+        if base_url is None:
+            return outcome("unknown", "Linked booking details were unavailable for the reloaded reservation.", RECONCILE)
         try:
             details = form.booking_details(base_url, day, record, selection.space)
         except BookingProblem as error:
             return outcome("unknown", error.reason, RECONCILE)
+        except Exception:
+            return outcome("unknown", "Linked booking details could not be read for the reloaded reservation.", RECONCILE)
         detail_statuses = booking_statuses(details)
         detail_days = dates(details, form.day_first)
         references |= booking_references(details)
@@ -1393,9 +1427,7 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
     if references:
         receipt["confirmation_reference"] = references.pop()
     if linked:
-        receipt["reason"] = "Linked booking details corroborated the statusless reservation in reloaded Bookings."
-    elif superficie:
-        receipt["reason"] = "The exact reservation showed a confirmed status in reloaded Bookings."
+        receipt["reason"] = "Linked booking details corroborated the exact reservation in reloaded Bookings."
     if recovered:
         receipt["reconciled"] = True
     return receipt

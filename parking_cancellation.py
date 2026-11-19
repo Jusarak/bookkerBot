@@ -12,6 +12,7 @@ from parking_booking import (
 )
 
 CANCEL_CHECK = "Check the selected reservation in Bookker Bookings."
+PARKING_TYPE = re.compile(r"\b(?:parking|aparcamiento|estacionamiento|plaza)\b", re.I)
 MENU_TRIGGER = re.compile(r"^(?:more(?: actions| options|_vert|_horiz)?|"
                           r"booking actions|options|acciones|opciones|más opciones)$", re.I)
 DELETE = re.compile(r"^(?:(?:delete|eliminar)\s+)?(?:Delete|Eliminar)(?: (?:this )?(?:booking|reservation|"
@@ -42,6 +43,7 @@ def booking_location(text):
         return buildings.pop(), floors.pop()
     combined = list(field_values(text, r"Building|Edificio|Location|Ubicación", split_inline=False))
     combined.extend(re.findall(r"^\s*(?:location_on|place)\s*([^\n]+)", text, re.I | re.M))
+    combined.extend(line for line in text.splitlines() if PARKING_TYPE.search(line))
     for label in combined:
         names = re.split(r"\s*[,/|·]\s*", label.strip().rstrip(","))
         if len(names) == 2 and all(names) and shows_location(text, *names):
@@ -49,71 +51,93 @@ def booking_location(text):
     return None
 
 
-def find_reservation(records, target, *, day_first):
+def find_reservation(records, target, form, base_url, day):
     matches = []
-    incomplete = False
-    day = date.fromisoformat(target.date) if target.date else None
+    location = (target.building, target.floor) if target.building else None
     for record in records:
-        days = dates(record, day_first)
-        references = booking_references(record)
         if target.reference:
-            if target.reference not in references:
-                continue
-            if len(references) != 1 or len(days) != 1 or (day is not None and days != {day}):
-                incomplete = True
+            if target.reference not in booking_references(record):
                 continue
         else:
-            if not shows(record, SPACE_FIELD, target.space):
-                continue
+            days = dates(record, form.day_first)
+            labelled_spaces = {normalized(value) for value in field_values(record, SPACE_FIELD)}
             if days and day not in days:
                 continue
-            if not shows_location(record, target.building, target.floor):
-                if not booking_location(record):
-                    incomplete = True
+            if not (shows(record, SPACE_FIELD, target.space) or normalized(target.space) in labelled_spaces):
                 continue
-            if days != {day} or len(references) > 1:
-                incomplete = True
+            if not shows_location(record, *location) and booking_location(record):
                 continue
-        matches.append(record)
-    if len(matches) > 1:
-        raise BookingProblem("More than one Bookings row matched the cancellation selector.", CANCEL_CHECK)
-    if incomplete:
-        raise BookingProblem("A possible matching Bookings row had conflicting or incomplete details.", CANCEL_CHECK)
+        resolved = reservation_details(record, target, location, form, base_url, day)
+        if resolved is not None:
+            details, recurring = resolved
+            matches.append((record, details, recurring))
+            if len(matches) > 1:
+                raise BookingProblem("More than one Bookings row matched the cancellation selector.", CANCEL_CHECK)
     return matches[0] if matches else None
 
 
-def reservation_details(record, target, form, base_url, day):
-    location = (target.building, target.floor) if target.building else booking_location(record)
+def reservation_details(record, target, requested_location, form, base_url, day):
+    def location_in(text):
+        if requested_location and shows_location(text, *requested_location):
+            return requested_location
+        return booking_location(text)
+
+    location = location_in(record)
     space = target.space or booking_space(record)
-    if target.reference and not (location and space):
+    if not space:
         row = form.booking_row(base_url, day, record)
         name = visible(row.locator(".resource-name, .booking-name, [data-testid=booking-space]"))
-        if not space and name.count() == 1:
+        if name.count() == 1:
             candidate = name.inner_text(timeout=1000).strip()
             if re.fullmatch(SPACE_CODE, candidate) and shows(record, SPACE_FIELD, candidate):
                 space = candidate
+
+    days = dates(record, form.day_first)
+    references = booking_references(record)
+    hours = intervals(record)
+    linked = ""
+    if not (location and space and days):
+        linked = form.booking_details(base_url, day, record, space)
+        linked_location = location_in(linked)
+        if linked_location and location and not shows_location(linked, *location):
+            raise BookingProblem("The linked booking details showed a different location.", CANCEL_CHECK)
+        location = location or linked_location
+        space = space or booking_space(linked)
+        days |= dates(linked, form.day_first)
+        references |= booking_references(linked)
+        hours = hours or intervals(linked)
+
     if not location or not space:
         raise BookingProblem("Bookker did not show the parking space and location for the selected reservation.",
                              CANCEL_CHECK)
     building, floor = location
-    types = {normalized(value) for value in field_values(record, r"Type|Resource type|Tipo")}
-    parking = re.compile(r"\b(?:parking|aparcamiento|estacionamiento|plaza)\b", re.I)
-    if not all(parking.search(value) for value in (types or {floor})):
+    # The linked panel can omit fields already shown on the card.
+    if any(list(field_values(text, SPACE_FIELD)) and not shows(text, SPACE_FIELD, space)
+           for text in (record, linked)):
+        raise BookingProblem("A possible matching Bookings row showed conflicting spaces.", CANCEL_CHECK)
+    text = f"{record}\n{linked}"
+    if (len(days) != 1 or (day is not None and days != {day}) or len(references) > 1
+            or not shows_location(f"{text}\nBuilding: {building}\nFloor: {floor}", building, floor)):
+        raise BookingProblem("A possible matching Bookings row had conflicting or incomplete details.", CANCEL_CHECK)
+    if requested_location and location != requested_location:
+        return None
+    types = {normalized(value) for value in field_values(text, r"Type|Resource type|Tipo")}
+    if not all(PARKING_TYPE.search(value) for value in (types or {floor})):
         raise BookingProblem("The selected reservation could not be verified as parking.", CANCEL_CHECK)
-    reservation_day, = dates(record, form.day_first)
-    references = booking_references(record)
+    reservation_day, = days
     details = {"date": reservation_day.isoformat(), "timezone": MADRID,
                "building": building, "floor": floor, "space": space}
     if references:
         details["confirmation_reference"] = references.pop()
-    hours = sorted(intervals(record))
     if hours:
+        hours = sorted(hours)
         details.update(start_time=hours[0][0], end_time=hours[-1][1],
                        displayed_intervals=[list(span) for span in hours])
-    return details
+    recurrence = re.sub(r"(?im)^\s*(?:no repeat|repeat\s*:\s*none|sin repetición)\s*$", "", text)
+    return details, bool(RECURRING.search(recurrence))
 
 
-def cancellation_action(form, row, record):
+def cancellation_action(form, row, record, *, recurring):
     page = form.page
     menus = visible(page.get_by_role("menu"))
     dialogs = visible(page.get_by_role("dialog").or_(page.locator("mat-dialog-container, ion-modal")))
@@ -133,23 +157,25 @@ def cancellation_action(form, row, record):
     items = menu.get_by_role("menuitem").or_(menu.get_by_role("button"))
     single = visible(items.and_(menu.get_by_text(SINGLE)))
     if single.count() == 1:
-        return single, dialogs
+        return single, dialogs, False
     delete = visible(menu.get_by_role("menuitem", name=DELETE).or_(menu.get_by_role("button", name=DELETE)))
     if delete.count() != 1 or not delete.is_enabled(timeout=1000) or single.count():
         raise BookingProblem("Bookker did not expose one Delete action in the selected row's menu.", CANCEL_CHECK)
-    recurrence = re.sub(r"(?im)^\s*(?:no repeat|repeat\s*:\s*none|sin repetición)\s*$", "", record)
-    if RECURRING.search(recurrence) and delete.get_attribute("aria-haspopup", timeout=1000) != "dialog":
+    if recurring and delete.get_attribute("aria-haspopup", timeout=1000) != "dialog":
         raise BookingProblem("Bookker did not verify a single-occurrence Delete action for the recurring row.",
                              CANCEL_CHECK)
-    return delete, dialogs
+    return delete, dialogs, recurring
 
 
-def confirm_cancellation(dialogs, details, *, day_first):
+def confirm_cancellation(dialogs, details, *, day_first, needs_occurrence_choice):
     try:
         dialogs.wait_for(timeout=5000)
     except Exception:
         # Some row-level Delete controls act immediately.
         if not dialogs.count():
+            if needs_occurrence_choice:
+                raise BookingProblem("Bookker did not show a single-occurrence choice for the recurring row.",
+                                     CANCEL_CHECK) from None
             return
         raise
     if dialogs.count() != 1:
@@ -180,7 +206,7 @@ def confirm_cancellation(dialogs, details, *, day_first):
             raise BookingProblem("Bookker did not retain the single-occurrence choice.", CANCEL_CHECK)
         action = delete
     elif (not single_button.count() and not occurrence.count() and delete.count() == 1
-          and not RECURRING.search(text)
+          and not needs_occurrence_choice and not RECURRING.search(text)
           and re.search(r"\b(?:this (?:booking|reservation)|delete (?:booking|reservation)|(?:esta |eliminar )reserva)\b",
                         text, re.I)):
         action = delete
@@ -217,24 +243,24 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
         form = ParkingForm(client.page)
         base_url = client.base_url
         records = form.bookings(base_url, day, reload=True)
-        row_text = find_reservation(records, target, day_first=form.day_first)
-        if attempted and row_text is None and target.reference:
-            row_text = find_reservation(records, stored_location(details), day_first=form.day_first)
-        if row_text is None:
+        selected = find_reservation(records, target, form, base_url, day)
+        if attempted and selected is None and target.reference:
+            selected = find_reservation(records, stored_location(details), form, base_url, day)
+        if selected is None:
             if attempted:
                 return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
             return result("absent", "No parking reservation matched in reloaded Bookings.")
         if attempted:
             return result("unknown", "A cancellation intent already exists and the selector still matches a Bookings row.")
 
-        details = reservation_details(row_text, target, form, base_url, day)
+        row_text, details, recurring = selected
         if not confirm:
             return {**result("preview", "One parking reservation matched."), "dry_run": True}
         if state is None:
             return result("blocked", "Cancellation requires a persistent submission state path.")
         show_preview(details)
         row = form.booking_row(base_url, day, row_text)
-        action, dialogs = cancellation_action(form, row, row_text)
+        action, dialogs, needs_occurrence_choice = cancellation_action(form, row, row_text, recurring=recurring)
         try:
             write_json(state, {"version": 1, "action": "cancel-one-occurrence", "target": asdict(target),
                                "reservation": details}, exclusive=True)
@@ -244,7 +270,8 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
         action_error = None
         try:
             action.click(timeout=5000)
-            confirm_cancellation(dialogs, details, day_first=form.day_first)
+            confirm_cancellation(dialogs, details, day_first=form.day_first,
+                                 needs_occurrence_choice=needs_occurrence_choice)
             form.settled()
         except BookingProblem as error:
             action_error = error.reason
@@ -252,9 +279,9 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
             action_error = "The Bookker cancellation action could not be verified."
         day = date.fromisoformat(details["date"])
         records = form.bookings(base_url, day, reload=True)
-        remaining = find_reservation(records, target, day_first=form.day_first)
+        remaining = find_reservation(records, target, form, base_url, day)
         if remaining is None and target.reference:
-            remaining = find_reservation(records, stored_location(details), day_first=form.day_first)
+            remaining = find_reservation(records, stored_location(details), form, base_url, day)
         if remaining is None:
             return result("cancelled", "The selected reservation was absent from reloaded Bookings.")
         return result("unknown", action_error or "The selected reservation is still present in reloaded Bookings.")
