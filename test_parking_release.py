@@ -12,11 +12,70 @@ from unittest.mock import Mock, patch
 
 import parking_release
 from parking_booking import (
-    BOOK_ACTION, BOOKING_LOADING, FINAL_ACTION, FINAL_ATTEMPT, PRIOR_RESULTS, READY_BUTTON, SIGN_IN,
-    SUBMISSION_VIEW, BookingProblem, ParkingForm, read_intent, write_json,
+    BOOK_ACTION, BOOKING_LOADING, FINAL_ACTION, FINAL_ATTEMPT, READY_BUTTON, SIGN_IN, SUBMISSION_VIEW,
+    WATCH_SPACE_SEARCH, BookingProblem, ParkingForm, read_intent, write_json,
 )
 from parking_schedule import EXAMPLE, PRODUCTION, Schedule, ZONE
 from test_parking_booking import MATCH, OfflineForm, locator
+
+
+SEARCH_COMPLETION_FIXTURE = r"""async (source, loading) => {
+    const button = {contains: el => el === button};
+    const cached = {textContent: 'Space: STALE-144'};
+    const loader = inResults => ({
+        closest: selector => inResults && selector === 'app-resources',
+        getClientRects: () => [1]
+    });
+    const listeners = new Map();
+    let loaders = [];
+    let notify;
+    let complete = false;
+    const document = {
+        documentElement: {},
+        querySelectorAll: selector => selector === loading ? loaders : [],
+        addEventListener: (type, listener) => listeners.set(type, listener),
+        removeEventListener: type => listeners.delete(type)
+    };
+    class MutationObserver {
+        constructor(callback) { this.callback = callback; }
+        observe() { notify = this.callback; }
+        disconnect() { notify = undefined; }
+    }
+    const create = new Function('document', 'MutationObserver', 'getComputedStyle',
+                                `return (${source});`);
+    const watch = create(document, MutationObserver, () => ({visibility: 'visible'}));
+    watch(button, loading).completed.then(() => { complete = true; });
+    const click = (target, isTrusted) => listeners.get('click')?.({isTrusted, composedPath: () => [target]});
+    click({}, true);
+    click(button, false);
+    if (notify) throw new Error('An unrelated click armed the search');
+    click(button, true);
+    const mutate = async (nextLoaders, rows = [cached]) => {
+        loaders = nextLoaders;
+        notify?.([{type: 'childList', addedNodes: rows}]);
+        await Promise.resolve();
+    };
+    await mutate([loader(false)]);
+    await mutate([], [{...cached}]);
+    if (complete) throw new Error('An unrelated loader or a cached render completed the search');
+    const searchLoader = loader(true);
+    await mutate([searchLoader]);
+    await mutate([searchLoader], [{...cached}]);
+    if (complete) throw new Error('Cached inventory completed the search while it was loading');
+    await mutate([loader(false)], [{...cached}]);
+    if (!complete || notify) throw new Error('The completed search did not release its results');
+}"""
+
+
+class SearchCompletionTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable")
+    def test_observer_waits_for_the_dispatched_search_to_finish(self):
+        script = """const [fixture, source, loading] = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+        eval(fixture)(source, loading).catch(error => { console.error(error); process.exitCode = 1; });"""
+        result = subprocess.run(["node", "-e", script], input=json.dumps([
+            SEARCH_COMPLETION_FIXTURE, WATCH_SPACE_SEARCH, BOOKING_LOADING,
+        ]), capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class FixtureClock:
@@ -129,12 +188,20 @@ class ReleaseControls(ReleaseForm, ParkingForm):
         self.day = None
         self.selected = set()
         self.submitted_search = False
+        self.search_complete = False
         self.empty = locator(0)
         self.empty.all.return_value = []
         self.label = Mock(return_value=self.empty)
+        self.empty_message = locator(0)
+        self.empty_message.first = self.empty_message
+        self.empty_message.count.side_effect = lambda: int(
+            self.fixture.unavailable if self.search_complete else self.fixture.stale_empty
+        )
         self.search = locator()
         self.search.first = self.search
         self.search.press.side_effect = self.dispatch_search
+        self.search.evaluate_handle.side_effect = self.watch_search
+        self.watch = Mock()
         self.day_loader = locator()
         self.day_loader.first = self.day_loader
         self.day_loader.wait_for.side_effect = self.shifts_loaded
@@ -144,20 +211,16 @@ class ReleaseControls(ReleaseForm, ParkingForm):
         self.shifts_loaded_at = None
         self.rows = locator()
         self.rows.first = self.rows
-        self.rows.wait_for.side_effect = self.results_loaded
         self.rows.all.side_effect = self.available_rows
-        self.raw_rows = locator()
+        self.rows.count.side_effect = lambda: len(self.available_rows())
+        self.rows.or_.side_effect = lambda other: (
+            other if other is self.empty_message and not self.rows.count() else self.rows
+        )
         self.stale_row = locator(text="Space: STALE-144\nAvailable\n07:00–23:00")
-        self.raw_rows.all.side_effect = lambda: [self.stale_row] if self.fixture.stale_results else []
-        fresh_selector = locator()
-        self.raw_rows.and_.side_effect = lambda filter_by: self.rows if filter_by is fresh_selector else self.raw_rows
-        self.prior_results = locator()
-        self.prior_results.evaluate_all.side_effect = self.capture_prior_results
-        self.captured = False
+        self.cached_copy = locator(text=self.stale_row.inner_text.return_value)
         self.list_button = locator(0)
         self.list_button.first = self.list_button
         self.list_button.or_.side_effect = lambda other: other if other is self.rows else self.list_button
-        self.list_button.wait_for.side_effect = self.results_loaded
         self.dialog = locator(text=MATCH.replace("November 23", "November 30") + "Book")
         self.dialog.last = self.dialog
         self.submit = locator()
@@ -170,18 +233,18 @@ class ReleaseControls(ReleaseForm, ParkingForm):
         row.get_by_role.return_value = self.choose
         self.choose.click.side_effect = lambda **kwargs: self.events.append("resource")
         self.row = row
-        self.empty.or_.side_effect = lambda other: other if other is self.rows else self.prior_results
+        self.empty.or_.side_effect = lambda other: other if other is self.rows else self.empty
         page.locator.side_effect = {
             "input[type=date]": locator(), "mat-calendar": locator(0), "mat-chip-option": self.shifts,
             BOOKING_LOADING: self.day_loader,
             ":not(mat-chip-option *)": locator(), READY_BUTTON: locator(),
-            f":not([{PRIOR_RESULTS}])": fresh_selector,
-            "button": locator(0), "tbody tr, mat-list-option": self.raw_rows,
+            "button": locator(0), "tbody tr, mat-list-option": self.rows,
             "app-resources article.list-container mat-list-item": self.empty,
             "mat-dialog-container, ion-modal": self.dialog,
         }.__getitem__
-        page.get_by_text.return_value = self.empty
+        page.get_by_text.return_value = self.empty_message
         page.get_by_role.side_effect = self.role
+        page.wait_for_function.side_effect = self.finish_search
         page.wait_for_load_state.side_effect = lambda *args, **kwargs: testcase.fail("Post-release network idle")
 
     def role(self, role, name=None):
@@ -226,33 +289,39 @@ class ReleaseControls(ReleaseForm, ParkingForm):
 
     def dispatch_search(self, key, *, timeout):
         assert key == "Enter" and self.selected == {"07:00–14:00", "14:00–23:00"}
-        assert self.captured
+        assert self.fixture.clock.now() >= self.fixture.occurrence.release
         self.events.append("search")
         self.submitted_search = True
+        if self.fixture.stale_results or self.fixture.stale_empty:
+            self.events.append("cached_rerender")
 
-    def capture_prior_results(self, script, args):
-        assert not self.submitted_search and args[1] == PRIOR_RESULTS
-        assert "keydown" in script and "MutationObserver" in script
+    def watch_search(self, script, loading, *, timeout):
+        assert not self.submitted_search and script == WATCH_SPACE_SEARCH and loading == BOOKING_LOADING
         if self.fixture.stale_results:
-            assert self.raw_rows.all() == [self.stale_row]
-        self.captured = True
+            assert self.rows.all() == [self.stale_row]
+        return self.watch
 
-    def results_loaded(self, *, timeout):
-        assert self.submitted_search
-        if "results" not in self.events:
-            if self.fixture.stale_results:
-                assert self.raw_rows.all() == [self.stale_row]
-                self.stale_row.get_by_role.return_value.click.assert_not_called()
-            seconds = timeout / 1000
-            if self.fixture.result_seconds > seconds:
-                self.fixture.clock.advance(seconds)
-                raise TimeoutError("results did not refresh")
-            self.events.append("results")
-            self.fixture.clock.advance(self.fixture.result_seconds)
+    def finish_search(self, script, *, arg, timeout):
+        assert self.submitted_search and not self.search_complete
+        assert arg is self.watch and script == "watch => watch.completed"
+        if self.fixture.stale_results:
+            assert self.rows.all() == [self.cached_copy]
+        if self.fixture.stale_empty:
+            assert self.empty_message.count() == 1
+        seconds = timeout / 1000
+        if self.fixture.result_seconds > seconds:
+            self.fixture.clock.advance(seconds)
+            raise TimeoutError("results did not refresh")
+        self.events.append("results")
+        self.fixture.clock.advance(self.fixture.result_seconds)
+        self.search_complete = True
 
     def available_rows(self):
-        assert "results" in self.events
-        return [self.row]
+        if self.search_complete:
+            return [] if self.fixture.unavailable else [self.row]
+        if self.fixture.stale_results:
+            return [self.cached_copy if self.submitted_search else self.stale_row]
+        return []
 
     def submit_ready(self, **kwargs):
         assert "resource" in self.events
@@ -309,7 +378,8 @@ class ReleaseConfirmation(ReleaseControls):
         self.prompt_at = self.fixture.clock.now() + timedelta(seconds=self.fixture.final_seconds)
 
     def wait_for_change(self, script, *, arg, timeout):
-        assert script == SUBMISSION_VIEW
+        if script != SUBMISSION_VIEW:
+            return self.finish_search(script, arg=arg, timeout=timeout)
         if arg["before"] is not None:
             seconds = (self.prompt_at - self.fixture.clock.now()).total_seconds()
             if seconds > timeout / 1000:
@@ -389,6 +459,7 @@ class ScheduledEntryPointTests(unittest.TestCase):
         self.unavailable = False
         self.stale_form = False
         self.stale_results = False
+        self.stale_empty = False
         self.expired = False
         self.expired_on_reload = False
         self.prep_seconds = 2
@@ -507,16 +578,18 @@ class ScheduledEntryPointTests(unittest.TestCase):
 
     def test_search_results_wait_uses_only_remaining_release_time(self):
         self.form = ReleaseControls(self, self.page)
+        self.stale_results = True
         self.clock.at = self.occurrence.release + timedelta(seconds=56.942)
         self.result_seconds = 0.2
         code, trace = self.run_entry()
         self.assertEqual(code, 0)
         self.assertEqual(self.fixture_time(trace, "refresh_dispatch"),
                          self.occurrence.release + timedelta(seconds=59.960))
-        self.form.rows.wait_for.assert_called_once_with(timeout=40)
+        self.page.wait_for_function.assert_called_once_with("watch => watch.completed", arg=self.form.watch, timeout=40)
         self.assertEqual(trace[-1]["outcome"], "missed")
         self.assertEqual(trace[-1]["offset_ms"], 60000)
         self.assertNotIn("resource", self.form.events)
+        self.form.cached_copy.get_by_role.assert_not_called()
         self.assertFalse(self.intent.exists())
 
     def test_window_closing_during_intent_persistence_reports_missed_without_click(self):
@@ -532,17 +605,55 @@ class ScheduledEntryPointTests(unittest.TestCase):
         self.assertEqual(self.form.clicks, 0)
         self.assertEqual(read_intent(self.intent), self.form.selection)
 
-    def test_retained_results_are_ignored_while_fresh_search_is_in_flight(self):
+    def test_rerendered_cached_rows_are_ignored_until_the_search_completes(self):
         self.form = ReleaseControls(self, self.page)
         self.stale_results = True
         self.result_seconds = 0.150
         code, trace = self.run_entry()
         self.assertEqual(code, 0)
         self.assertEqual(trace[-1]["outcome"], "confirmed")
+        self.assertEqual(self.form.events[4:8], ["search", "cached_rerender", "results", "resource"])
         self.assertEqual(self.fixture_time(trace, "submit_dispatch"),
                          self.occurrence.release + timedelta(milliseconds=175))
+        self.assertEqual(self.fixture_time(trace, "submit_dispatch"), self.review_at)
+        self.assertEqual(self.clock.sleeps, [57])
         self.assertEqual(read_intent(self.intent).space, "PTQ-123")
         self.form.stale_row.get_by_role.assert_not_called()
+        self.form.cached_copy.get_by_role.assert_not_called()
+        if os.environ.get("BOOKKER_OFFLINE_TRACE") == "1":
+            for row in trace:
+                print(json.dumps(row))
+
+    def test_cached_empty_message_is_ignored_until_the_search_completes(self):
+        self.form = ReleaseControls(self, self.page)
+        self.stale_empty = True
+        code, trace = self.run_entry()
+        self.assertEqual(code, 0)
+        self.assertEqual(trace[-1]["outcome"], "confirmed")
+        self.assertEqual(self.form.events[4:8], ["search", "cached_rerender", "results", "resource"])
+
+    def test_completed_search_with_empty_inventory_exits_without_an_intent(self):
+        self.form = ReleaseControls(self, self.page)
+        self.unavailable = True
+        code, trace = self.run_entry()
+        self.assertEqual(code, 0)
+        self.assertEqual(trace[-1]["outcome"], "unavailable")
+        self.assertEqual(self.form.events[-2:], ["search", "results"])
+        self.assertFalse(self.intent.exists())
+
+    def test_reload_confirms_the_saved_full_day_from_contiguous_shifts(self):
+        self.form = ReleaseControls(self, self.page)
+        self.confirmed_record = self.confirmed_record.replace("7:00 AM – 11:00 PM", "07:00–14:00\n14:00–23:00")
+        code, trace = self.run_entry()
+        self.assertEqual(code, 0)
+        self.assertEqual(trace[-1]["outcome"], "confirmed")
+        self.assertEqual(trace[-2]["event"], "confirmation_observed")
+        selection = read_intent(self.intent)
+        self.assertEqual((selection.start_time, selection.end_time), ("07:00", "23:00"))
+        self.assertEqual(self.form.clicks, 1)
+        if os.environ.get("BOOKKER_OFFLINE_TRACE") == "1":
+            for row in trace:
+                print(json.dumps(row))
 
     def test_separate_confirmation_dispatches_as_soon_as_enabled(self):
         self.form = ReleaseConfirmation(self, self.page)

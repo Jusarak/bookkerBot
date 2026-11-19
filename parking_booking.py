@@ -96,7 +96,34 @@ NO_SPACES = re.compile(
     r"(?: for (?:the|this) selected (?:date|interval|period|schedule))?"
     r"|No availability|No hay (?:plazas|recursos)(?: de aparcamiento)? disponibles)\.?$", re.I,
 )
-PRIOR_RESULTS = "data-bookker-before-search"
+WATCH_SPACE_SEARCH = r"""(button, loading) => {
+    let finish;
+    const completed = new Promise(resolve => { finish = resolve; });
+    const busy = () => Array.from(document.querySelectorAll(loading)).some(el =>
+        (button.contains(el) || el.closest('app-resources')) &&
+        el.getClientRects().length && getComputedStyle(el).visibility === 'visible');
+
+    function dispatched(event) {
+        if (!event.isTrusted || !event.composedPath().includes(button)) return;
+        document.removeEventListener('click', dispatched, true);
+        // A load already in progress cannot establish completion of this search.
+        if (busy()) return;
+        let started = false;
+        const observer = new MutationObserver(() => {
+            if (busy()) started = true;
+            else if (started) {
+                observer.disconnect();
+                finish(true);
+            }
+        });
+        observer.observe(document.documentElement, {
+            subtree: true, childList: true, attributes: true,
+            attributeFilter: ['aria-busy', 'role', 'hidden', 'class', 'style']
+        });
+    }
+    document.addEventListener('click', dispatched, true);
+    return {completed};
+}"""
 UNAVAILABLE_SPACE = re.compile(
     r"\b(?:unavailable|occupied|not available|no disponible|ocupad[ao])\b", re.I,
 )
@@ -915,31 +942,6 @@ class ParkingForm:
         # Bookker can render the shift group while it is still loading the day.
         visible(self.page.locator(BOOKING_LOADING)).first.wait_for(state="hidden", timeout=self.wait_timeout(5000))
 
-    def mark_prior_results(self, search, results):
-        # A completed render can reuse rows. Exclude old nodes until their
-        # result data changes, even if a loader or list toggle hides them.
-        button = search.element_handle(timeout=self.wait_timeout(5000))
-        results.evaluate_all(r"""(elements, [button, marker]) => {
-            if (!elements.length) return;
-            const data = el => [
-                el.textContent.trim().replace(/\s+/g, ' '),
-                el.getAttribute('data-available'), el.getAttribute('data-id')
-            ].join('\n');
-            function dispatched(event) {
-                if (event.key !== 'Enter' || !event.composedPath().includes(button)) return;
-                document.removeEventListener('keydown', dispatched, true);
-                const prior = elements.map(el => [el, data(el)]);
-                new MutationObserver(() => {
-                    for (const [el, before] of prior) el.toggleAttribute(marker, data(el) === before);
-                }).observe(document, {
-                    subtree: true, childList: true, characterData: true,
-                    attributes: true, attributeFilter: ['data-available', 'data-id']
-                });
-            }
-            for (const el of elements) el.setAttribute(marker, '');
-            document.addEventListener('keydown', dispatched, true);
-        }""", [button, PRIOR_RESULTS])
-
     def select_space(self, building, floor, span, spot_name, spot_id, *, require_material=False, on_dispatch=None):
         random_booking = visible(self.page.get_by_role(
             "switch", name=re.compile(r"random (?:parking )?space|plaza aleatoria", re.I)
@@ -952,7 +954,7 @@ class ParkingForm:
         search = visible(self.page.get_by_role(
             "button", name=re.compile(r"\b(?:Search parking spaces|Buscar plazas de aparcamiento)\b", re.I)
         ))
-        empty = self.page.get_by_text(NO_SPACES) if on_dispatch else self.label(NO_SPACES)
+        empty = visible(self.page.get_by_text(NO_SPACES)) if on_dispatch else self.label(NO_SPACES)
         list_button = self.page.get_by_role(
             "button", name=re.compile(r"^(?:(?:list|format_list_bulleted)\s+)?"
                                       r"(?:List(?: view)?|Show list|View list|Lista|Ver lista)$", re.I)
@@ -976,16 +978,17 @@ class ParkingForm:
                 return None
             search.focus(timeout=self.wait_timeout(10_000))
             if on_dispatch:
-                self.mark_prior_results(search, empty.or_(toggle).or_(rows).or_(row_locator))
+                # Arm before pressing Search so even a fast load is observed.
+                watch = search.evaluate_handle(WATCH_SPACE_SEARCH, BOOKING_LOADING, timeout=self.wait_timeout(5000))
             timeout = on_dispatch("refresh_dispatch") if on_dispatch else 10_000
             search.press("Enter", timeout=timeout)
             if on_dispatch is None:
                 self.settled()
         if on_dispatch:
-            fresh = self.page.locator(f":not([{PRIOR_RESULTS}])")
-            empty, toggle, rows, row_locator = (
-                visible(control.and_(fresh)) for control in (empty, toggle, rows, row_locator)
-            )
+            with self.parking_step("Bookker's parking search did not show a completed results load.",
+                                   "Check the Search parking spaces loading and results view."):
+                self.page.wait_for_function("watch => watch.completed", arg=watch, timeout=self.wait_timeout(5000))
+            toggle, rows, row_locator = map(visible, (toggle, rows, row_locator))
             results = row_locator if require_material else row_locator.or_(rows)
             toggle.or_(results).or_(empty).first.wait_for(timeout=self.wait_timeout(5000))
             list_button = toggle if not results.count() else None
@@ -1734,7 +1737,7 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
     statuses = booking_statuses(record)
     references = booking_references(record)
     linked = False
-    if has_hours(record) and not shows_interval(record, selection):
+    if has_hours(record) and not shows_interval(record, selection, verify_all=verify_all):
         return outcome("unknown", "The reloaded reservation showed a different or unreadable schedule.", RECONCILE)
     if statuses and (any(not CONFIRMED_STATUS.fullmatch(status) for status in statuses)
                      or (not superficie and not complete(record))):

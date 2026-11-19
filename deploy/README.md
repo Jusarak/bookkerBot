@@ -74,6 +74,10 @@ sudo install -m 0600 -o marcos -g marcos /secure/path/session.json /var/lib/book
 To preview from the worker with operator-selected settings, use the following
 command during the warm-up or release window, while the timer is disabled. The
 preview uses the release gate and exact target, then stops at the reviewed form.
+Check that the deployed Bookker UI shows and clears an availability loading
+indicator on the Search button or inside `app-resources`. If the worker cannot
+observe that sequence after activating Search, it exits before selecting
+inventory.
 For an arbitrary offered date, use the existing `run_bookker.py book` preview.
 
 ```sh
@@ -341,16 +345,21 @@ wait and checks that the intent exists at the click. The offsets are synthetic
 and exclude real Playwright, disk and network overhead. Use journal offsets
 to measure the host after deployment.
 
-In the delayed search fixture, the previous list remains visible until 150 ms
-after Search. The worker ignores it and submits the newly rendered selection at
-+175 ms. The DOM guard excludes prior rows and empty messages until the search
-changes their result data or replaces them. A UI that returns the same DOM and
-data without a verifiable new render times out. A search dispatched 40 ms before
-cutoff exits as `missed` at cutoff without an intent. A separate confirmation
-fixture dispatches at +70 ms, 10 ms after the first click, when its control
-becomes enabled. The durable final confirmation claim exists at the click.
-The expiry-on-readback fixture keeps the intent and returns `uncertain` with
-a failing exit status, sending one synthetic alert across two attempts.
+In the delayed search fixture, Bookker recreates the cached rows with identical
+contents while the fresh search is in flight. The worker uses the warmed browser
+to wait for the loading cycle triggered by Search for the verified date,
+location and shifts. The fixture returns fresh inventory 150 ms after Search.
+Submission follows at +175 ms, when the verified form becomes ready. A cached
+empty message also stays gated until search completion. Reloaded Bookings
+confirms the saved 07:00–23:00 selection when the record lists 07:00–14:00 and
+14:00–23:00 separately.
+
+A search dispatched 40 ms before cutoff exits as `missed` at cutoff without
+an intent. A separate confirmation fixture dispatches at +70 ms, 10 ms after
+the first click, when its control becomes enabled. The durable final
+confirmation claim exists at the click. The expiry-on-readback fixture keeps
+the intent and returns `uncertain` with a failing exit status, sending one
+synthetic alert across two attempts.
 
 The phone fixture runs the renewal entry point, dispatches HTTP requests
 through the production handler and substitutes a local identity provider and
@@ -361,7 +370,12 @@ synthetic Gmail message once per expired state, suppresses the second alert,
 and picks up the newly installed state on its next run. Real relay delivery,
 Android MFA, host activation and live Bookker submission are operator checks.
 
-The Debian 13 `systemd-analyze calendar` check ran offline. In the implementation
-sandbox, `systemd-analyze verify` returned `Failed to setup working directory:
-Read-only file system` for the units. The sandbox also blocks binding sockets.
-Complete the unit, firewall and Tailscale checks on the target host.
+The Debian 13 `systemd-analyze calendar` check ran offline. Earlier offline
+verification with `systemd-analyze verify` passed for the three checked-in
+units and the generated example timer in a disposable Debian 13 root with
+systemd 257.13. That root supplied the host unit dependencies and executables
+at the configured installation paths, including `/usr/sbin/nft` and the
+checkout's `.venv/bin/python`. Installation and startup are operator steps. In the
+implementation sandbox, unit verification stopped during working-directory
+setup with `Read-only file system`. Complete the unit, firewall and Tailscale
+checks on the target host.
