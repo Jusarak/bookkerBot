@@ -49,6 +49,8 @@ class OfflineForm:
         self.space = "PTQ-123"
         self.span = ("07:00", "23:00")
         self.details = None
+        self.linked = {}
+        self.detail_reads = []
 
     def check_session(self):
         pass
@@ -106,9 +108,11 @@ class OfflineForm:
     def booking_details(self, base_url, day, record, space):
         assert record in self.after_submit and space == self.space
         self.events.append("details")
-        if self.details is None:
+        self.detail_reads.append(record)
+        details = self.linked.get(record, self.details)
+        if details is None:
             raise BookingProblem("The matching Bookings row did not expose one booking details link.")
-        return self.details
+        return details
 
     def review(self, day, span, all_day, building, floor, choice, vehicle):
         assert vehicle == self.vehicle
@@ -533,6 +537,26 @@ class CancellationCommandTests(unittest.TestCase):
                 self.form.trigger.click.assert_called_once()
                 self.form.delete.click.assert_called_once()
 
+    def test_cancel_readback_checks_linked_reference_on_changed_date(self):
+        args = (*self.selector, "--confirm", "--submission-state", str(self.state))
+        changed = self.form.target.replace("November 26", "November 27")
+        card = changed.replace("\nConfirmation reference: OFFLINE-123", "")
+        self.form.linked[card] = changed
+        self.form.delete.click.side_effect = lambda **kwargs: self.form.records.__setitem__(0, card)
+        for _ in range(2):
+            result = self.run_command(*args)
+            self.assertEqual(result["outcome"], "unknown")
+            self.assertIn("different date", result["reason"])
+        self.assertEqual(self.form.detail_reads, [card, card])
+
+        self.form.linked[card] = card
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.form.linked[card] = changed.replace("OFFLINE-123", "OFFLINE-456")
+        self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+        self.assertEqual(self.form.records, [card, self.form.neighbor])
+        self.form.trigger.click.assert_called_once()
+        self.form.delete.click.assert_called_once()
+
     def test_wrong_ambiguous_and_absent_selectors_do_not_open_a_menu(self):
         confirm = ("--confirm", "--submission-state", str(self.state))
         for selector in (
@@ -867,6 +891,29 @@ class ParkingCommandTests(unittest.TestCase):
                 self.assertEqual(result["outcome"], "unknown")
                 self.assertIn("same reference", result["reason"])
         self.form.after_submit = [card, conflicts[0] + "\nReference: OFFLINE-C18"]
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "confirmed")
+        self.assertEqual(result["confirmation_reference"], "OFFLINE-C17")
+        self.assertEqual(self.form.clicks, 1)
+
+    def test_superficie_cli_checks_linked_reference_on_conflicting_card(self):
+        args = self.superficie_args() + ("--confirm",)
+        card = "November 21, 2026\nPSC-17\n07:00–23:00\nNEWTON, Parking Superficie C"
+        conflict = card.replace("Parking Superficie C", "Parking Torres Quevedo") + "\nStatus: Failed"
+        reference = "\nReference: OFFLINE-C17"
+        self.form.after_submit = [card, conflict]
+        self.form.linked = {card: card + reference, conflict: conflict + reference}
+        for _ in range(2):
+            result = self.run_command(*args)
+            self.assertEqual(result["outcome"], "unknown")
+            self.assertIn("same reference", result["reason"])
+        self.assertEqual(self.form.detail_reads, [card, conflict, card, conflict])
+
+        for details in (None, conflict):
+            with self.subTest(details=details):
+                self.form.linked[conflict] = details
+                self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.form.linked[conflict] = conflict + "\nReference: OFFLINE-C18"
         result = self.run_command(*args)
         self.assertEqual(result["outcome"], "confirmed")
         self.assertEqual(result["confirmation_reference"], "OFFLINE-C17")

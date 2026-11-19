@@ -1539,15 +1539,32 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
             if other == record:
                 continue
             other_references = booking_references(other)
-            if reference not in other_references:
+            if other_references and reference not in other_references:
                 continue
             other_days = dates(other, form.day_first)
             other_spaces = displayed_spaces(other, form.day_first, location)
-            if (other_references != references or (other_days and other_days != {day})
-                    or (other_spaces and other_spaces.keys() != space_names)
-                    or (has_location(other) and not matching_location(other))
-                    or (has_hours(other) and not shows_interval(other, selection))
-                    or any(not CONFIRMED_STATUS.fullmatch(status) for status in booking_statuses(other))):
+            conflicting = (
+                (other_references and other_references != references)
+                or (other_days and other_days != {day})
+                or (other_spaces and other_spaces.keys() != space_names)
+                or (has_location(other) and not matching_location(other))
+                or (has_hours(other) and not shows_interval(other, selection))
+                or any(not CONFIRMED_STATUS.fullmatch(status) for status in booking_statuses(other))
+            )
+            if not conflicting:
+                continue
+            if not other_references and day in other_days and other_spaces.keys() & space_names:
+                unresolved = "The linked reference for a conflicting Bookings row could not be verified."
+                if base_url is None:
+                    return outcome("unknown", unresolved, RECONCILE)
+                try:
+                    other_details = form.booking_details(base_url, day, other, selection.space)
+                except Exception:
+                    return outcome("unknown", unresolved, RECONCILE)
+                other_references = booking_references(other_details)
+                if len(other_references) != 1 and reference not in other_references:
+                    return outcome("unknown", unresolved, RECONCILE)
+            if reference in other_references:
                 return outcome("unknown", "Reloaded Bookings showed conflicting details for the same reference.",
                                RECONCILE)
         receipt["confirmation_reference"] = reference

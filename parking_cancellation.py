@@ -324,15 +324,26 @@ def cancel_parking(client, *, target, confirm, state, show_preview):
 
 def reservation_remaining(records, details, form, base_url, day):
     reference = details.get("confirmation_reference")
+    location = details["building"], details["floor"]
+    space = details["space"]
     if reference:
         for record in records:
-            if reference in booking_references(record):
-                shown_days = dates(record, form.day_first)
-                if shown_days and shown_days != {day}:
-                    raise BookingProblem("Reloaded Bookings showed the saved reference with a different date.",
-                                         CANCEL_CHECK)
+            shown_days = dates(record, form.day_first)
+            if not shown_days or shown_days == {day}:
+                continue
+            references = booking_references(record)
+            if (not references and shows_location(record, *location)
+                    and normalized(space) in displayed_spaces(record, form.day_first, location)):
+                linked = form.booking_details(base_url, day, record, space)
+                references = booking_references(linked)
+                if len(references) != 1 and reference not in references:
+                    raise BookingProblem("The linked reference for a Bookings row with a different date "
+                                         "could not be verified.", CANCEL_CHECK)
+            if reference in references:
+                raise BookingProblem("Reloaded Bookings showed the saved reference with a different date.",
+                                     CANCEL_CHECK)
         by_reference = CancelTarget(details["date"], None, None, None, reference)
         if find_reservation(records, by_reference, form, base_url, day):
             return True
-    by_location = CancelTarget(details["date"], details["building"], details["floor"], details["space"], None)
+    by_location = CancelTarget(details["date"], *location, space, None)
     return find_reservation(records, by_location, form, base_url, day) is not None
