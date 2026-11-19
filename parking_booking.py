@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 MADRID = "Europe/Madrid"
 FIRST_DAY = date(2026, 11, 19)
+TORRES_DATE = date(2026, 11, 26)
+TORRES_SHIFTS = (("07:00", "14:00"), ("14:00", "23:00"))
 RECONCILE = "Check the intended reservation in Bookker Bookings before retrying."
 SIGN_IN = "Renew the saved session through normal Bookker sign-in and rerun."
 CHECK_UI = "Check the indicated view in Bookker before rerunning."
@@ -31,6 +33,9 @@ NO_SPACES = re.compile(
     r"^(?:No (?:available )?(?:parking )?(?:spaces|resources)(?: are)?(?: available| found)?"
     r"(?: for (?:the|this) selected (?:date|interval|period|schedule))?"
     r"|No availability|No hay (?:plazas|recursos)(?: de aparcamiento)? disponibles)\.?$", re.I,
+)
+UNAVAILABLE_SPACE = re.compile(
+    r"\b(?:unavailable|occupied|not available|no disponible|ocupad[ao])\b", re.I,
 )
 NO_BOOKINGS = re.compile(
     r"^(?:(?:info(?:_outline)?|event_busy)\s+)?(?:No (?:tienes|hay) reservas(?: próximas| activas)?"
@@ -83,6 +88,12 @@ class Selection:
     floor: str
     space: str
     all_day: bool = False
+
+
+@dataclass(frozen=True)
+class SpaceChoice:
+    name: str
+    material: bool = False
 
 
 def write_json(path: Path, data: dict, *, exclusive=False):
@@ -183,6 +194,13 @@ def normalized(text):
     return " ".join(text.split()).casefold()
 
 
+def torres_shifts(day, building, floor):
+    if (day == TORRES_DATE and normalized(building) == "newton"
+            and normalized(floor) == "parking torres quevedo"):
+        return TORRES_SHIFTS
+    return ()
+
+
 def period_covers(label, day, today, day_first):
     label = normalized(label)
     explicit = sorted(dates(label, day_first))
@@ -245,6 +263,25 @@ def shows(text, labels, value):
     if labelled:
         return labelled == {normalized(value)}
     return any(normalized(part) == normalized(value) for part in fields(text))
+
+
+def shows_location(text, building, floor):
+    building_labels, floor_labels = r"Building|Edificio", r"Floor|Planta"
+    for labels, wanted in ((building_labels, building), (floor_labels, floor)):
+        values = {normalized(value) for value in field_values(text, labels)}
+        if values and values != {normalized(wanted)}:
+            return False
+    first, second = (re.escape(normalized(value)) for value in (building, floor))
+    separator = r"(?:\s*[-–—/,·•|]\s*|\s+)"
+    pair = re.compile(rf"(?:{first}{separator}{second}|{second}{separator}{first}|"
+                      rf"{first}\s*\({second}\)|{second}\s*\({first}\))")
+    lines = [re.sub(r"^(?:location_on|place)\s+", "", normalized(line)) for line in text.splitlines()]
+    location_label = re.compile(r"^(?:location|ubicación)\s*:\s*")
+    labelled = [location_label.sub("", line) for line in lines if location_label.match(line)]
+    if labelled and any(labelled):
+        return all(pair.fullmatch(line) for line in labelled)
+    return (shows(text, building_labels, building) and shows(text, floor_labels, floor)
+            or any(pair.fullmatch(line) for line in lines))
 
 
 def booking_space(text):
@@ -415,28 +452,36 @@ class ParkingForm:
             raise BookingProblem("Bookker did not show the same selected account vehicle.", action)
         return selected
 
-    def next_date(self, earliest):
+    def next_date(self, earliest, *, exact=False):
         control = self.control("Date")
         native = control.locator("input[type=date]").or_(control.and_(
             self.page.locator("input[type=date]")
         )).first
-        if native.count() and native.get_attribute("max"):
+        native_present = bool(native.count())
+        maximum = native.get_attribute("max") if native_present else None
+        if maximum or (exact and native_present):
             minimum = native.get_attribute("min")
             candidate = max(earliest, date.fromisoformat(minimum)) if minimum else earliest
-            if candidate > date.fromisoformat(native.get_attribute("max")):
+            if (maximum and candidate > date.fromisoformat(maximum)) or (exact and candidate != earliest):
+                return None
+            if exact and not native.is_editable():
                 return None
             native.fill(candidate.isoformat())
             native.press("Tab")
         else:
-            candidate = self.calendar_date(control, earliest)
+            candidate = self.calendar_date(control, earliest, exact=exact)
             if candidate is None:
                 return None
         self.settled()
-        if dates(self.value(self.control("Date"), "Date"), self.day_first) != {candidate}:
-            raise BookingProblem("Bookker did not retain the requested local date.")
+        self.check_date(candidate)
         return candidate
 
-    def calendar_date(self, control, earliest):
+    def check_date(self, day):
+        if dates(self.value(self.control("Date"), "Date"), self.day_first) != {day}:
+            raise BookingProblem("Bookker did not retain the requested local date.",
+                                 "Check the selected date in the Bookker parking form.")
+
+    def calendar_date(self, control, earliest, *, exact=False):
         calendar_button = re.compile(r"calendar|date|calendario", re.I)
         toggle = visible(control.get_by_role("button", name=calendar_button))
         if toggle.count() != 1:
@@ -478,13 +523,19 @@ class ParkingForm:
                 self.settled()
                 continue
             direction = "forward"
-            for day, cell in sorted(cells.items()):
+            if exact:
+                candidates = [(earliest, cells[earliest])] if earliest in cells else []
+            else:
+                candidates = sorted(cells.items())
+            for day, cell in candidates:
                 if (day >= earliest and day.month == month.month
                         and cell.is_enabled() and not cell.evaluate(
                             "(el) => !!el.closest('[aria-disabled=true], .mat-calendar-body-disabled')"
                         )):
                     cell.click()
                     return day
+            if exact and month >= earliest.replace(day=1):
+                return None
             if not following.count():
                 raise BookingProblem("Bookker's calendar did not show where the booking window ends.")
             if not following.is_enabled():
@@ -494,7 +545,7 @@ class ParkingForm:
             self.settled()
         raise BookingProblem("Bookker did not expose a bounded booking window.")
 
-    def whole_day(self):
+    def whole_day(self, expected_shifts=()):
         page = self.page
         all_day = self.label(ALL_DAY)
         chips = page.locator("mat-chip-option").filter(has_text=INTERVAL)
@@ -510,47 +561,88 @@ class ParkingForm:
             if (not shift.is_enabled() or not action.is_enabled()
                     or re.search(r"shift ended|turno finalizado", text, re.I)):
                 return None
-            shifts[schedule.pop()] = action
+            interval = schedule.pop()
+            if expected_shifts and interval in shifts:
+                raise BookingProblem("Bookker displayed the same parking shift more than once.")
+            shifts[interval] = shift, action
         if not shifts:
             empty = self.label(re.compile(r"^(?:No shifts available|No hay turnos disponibles)\.?$", re.I))
             if empty.count():
                 return None
             raise BookingProblem("Bookker did not display parking shift hours to verify a whole day.")
+        if expected_shifts:
+            if set(shifts) != set(expected_shifts):
+                return None
+            selected = """(el) => {
+                const active = '[aria-selected=true], [aria-pressed=true], [aria-checked=true]';
+                return el.matches(active + ', .mat-mdc-chip-selected, .mat-chip-selected, ' +
+                    '.mdc-evolution-chip--selected') || !!el.querySelector(active);
+            }"""
+            for interval in expected_shifts:
+                shift, action = shifts[interval]
+                if not shift.evaluate(selected):
+                    action.click()
+            self.settled()
+            if not all(shift.evaluate(selected) for shift, _ in shifts.values()):
+                raise BookingProblem("Bookker did not retain both requested parking shifts.",
+                                     "Check that both parking shifts are selected before searching.")
+            return (expected_shifts[0][0], expected_shifts[-1][1]), False
+
         use_all_day = bool(all_day.count() and all_day.is_enabled())
         start = min(shifts)
         end = max(shifts, key=lambda span: span[1])
         if use_all_day:
             all_day.click()
         else:
-            shifts[start].click()
+            shifts[start][1].click()
             if end != start:
-                shifts[end].click()
+                shifts[end][1].click()
         return (start[0], end[1]), use_all_day
 
-    def select_space(self, floor, span, spot_name, spot_id):
+    def select_space(self, building, floor, span, spot_name, spot_id, *, require_material=False):
         random_booking = visible(self.page.get_by_role(
-            "switch", name=re.compile(r"random parking space|plaza aleatoria", re.I)
-        )).first
-        if random_booking.count() and random_booking.get_attribute("aria-checked") != "false":
-            raise BookingProblem("Bookker's random parking booking option is on or could not be verified.")
+            "switch", name=re.compile(r"random (?:parking )?space|plaza aleatoria", re.I)
+        ))
+        switches = random_booking.count()
+        if (switches > 1 or (require_material and not switches)
+                or (switches and random_booking.get_attribute("aria-checked") != "false")):
+            raise BookingProblem("Bookker's random parking booking option is on or could not be verified.",
+                                 "Check that the random parking space switch is off before searching.")
         search = visible(self.page.get_by_role(
             "button", name=re.compile(r"\b(?:Search parking spaces|Buscar plazas de aparcamiento)\b", re.I)
-        )).first
-        if search.count() and not search.is_enabled():
-            return None
-        search.click()
-        self.settled()
+        ))
+        with self.parking_step("The Search parking spaces button could not be opened.",
+                               "Check the enabled Search parking spaces button in the parking form."):
+            search.wait_for(timeout=10_000)
+            if not search.is_enabled():
+                return None
+            search.focus(timeout=10_000)
+            search.press("Enter", timeout=10_000)
+            self.settled()
         if self.label(NO_SPACES).count():
             return None
         self.location("Floor", floor, select=False)
         list_button = visible(self.page.get_by_role(
-            "button", name=re.compile(r"^(?:List(?: view)?|Show list|View list|Lista|Ver lista)$", re.I)
-        ).or_(self.page.locator("button").filter(has_text=re.compile(r"^\s*(?:list|format_list_bulleted)\s*$")))).first
+            "button", name=re.compile(r"^(?:(?:list|format_list_bulleted)\s+)?"
+                                      r"(?:List(?: view)?|Show list|View list|Lista|Ver lista)$", re.I)
+        ).or_(self.page.locator("button").filter(has_text=re.compile(r"^\s*(?:list|format_list_bulleted)\s*$"))))
         if list_button.count():
-            list_button.click()
-            self.settled()
+            with self.parking_step("The Bookker map's List button could not be opened.",
+                                   "Check the enabled List button on the Bookker results map."):
+                if not list_button.is_enabled():
+                    raise BookingProblem("The Bookker map's List button is disabled.",
+                                         "Check whether Bookker can display its parking results as a list.")
+                list_button.focus(timeout=10_000)
+                list_button.press("Enter", timeout=10_000)
+                self.settled()
         if self.label(NO_SPACES).count():
             return None
+        material_rows = visible(self.page.locator("app-resources article.list-container mat-list-item")).all()
+        if material_rows:
+            return self.select_material_space(material_rows, building, floor, span, spot_name, spot_id)
+        if require_material:
+            raise BookingProblem("Bookker did not show a readable list of named parking resources.",
+                                 "Check the parking results list for named spaces with location and hours.")
         rows = visible(self.page.locator("tbody tr, mat-list-option").or_(
             self.page.get_by_role("row").filter(has_not=self.page.get_by_role("columnheader"))
         ).or_(self.page.get_by_role("listitem"))).all()
@@ -558,9 +650,7 @@ class ParkingForm:
         for row in rows:
             text = row.inner_text()
             status = row.get_attribute("data-available")
-            if status == "false" or re.search(
-                r"\b(?:unavailable|occupied|not available|no disponible|ocupad[ao])\b", text, re.I
-            ):
+            if status == "false" or UNAVAILABLE_SPACE.search(text):
                 continue
             available = status == "true" or re.search(
                 r"\b(?:available|free|disponible|libre)\b", text, re.I
@@ -593,31 +683,90 @@ class ParkingForm:
             else:
                 raise BookingProblem("Bookker did not show a separate control for selecting the parking space.")
             self.settled()
-            return name
+            return SpaceChoice(name)
         if rows and not unknown_availability:
             return None
         raise BookingProblem("Bookker did not expose a verifiable list of available parking spaces.")
 
-    def review(self, day, span, all_day, building, floor, space, vehicle):
-        dialog = visible(self.page.get_by_role("dialog").or_(
-            self.page.locator("mat-dialog-container, ion-modal")
-        )).last
-        dialog.wait_for()
-        submit = visible(dialog.get_by_role("button", name=re.compile(
-            r"^(?:Book|Reserve|Confirm(?: booking)?|Book parking space|Reservar|Confirmar(?: reserva)?)$", re.I
-        )))
+    def select_material_space(self, rows, building, floor, span, spot_name, spot_id):
+        unreadable = False
+        for row in rows:
+            text = row.inner_text()
+            if row.get_attribute("data-available") == "false" or UNAVAILABLE_SPACE.search(text):
+                continue
+            resource = visible(row.locator("app-resource"))
+            names = visible(resource.locator(".resource-name"))
+            choose = visible(resource.locator(".resource.clickable"))
+            if resource.count() != 1 or names.count() != 1 or choose.count() != 1:
+                unreadable = True
+                continue
+            name = names.inner_text().strip()
+            hours = intervals(text)
+            if not re.fullmatch(SPACE_CODE, name) or not hours:
+                unreadable = True
+                continue
+            if hours != {span} or not shows_location(text, building, floor) or not choose.is_enabled():
+                continue
+            if spot_name and normalized(name) != normalized(spot_name):
+                continue
+            if spot_id and spot_id not in (row.get_attribute("data-id"), resource.get_attribute("data-id"), name):
+                continue
+            with self.parking_step("The named parking resource could not be opened for review.",
+                                   "Check the named resource in the Bookker parking results list."):
+                choose.click(timeout=10_000)
+                self.settled()
+            return SpaceChoice(name, material=True)
+        if unreadable:
+            raise BookingProblem("Bookker showed parking rows without readable names, controls or hours.",
+                                 "Check the named spaces and their availability in the Bookker list.")
+        return None
+
+    def review(self, day, span, all_day, building, floor, choice, vehicle):
+        space = choice.name
+        if choice.material:
+            dialog = visible(self.page.locator("mat-dialog-container"))
+            submit_label = re.compile(r"^(?:Book|Reservar)$", re.I)
+        else:
+            dialog = visible(self.page.get_by_role("dialog").or_(
+                self.page.locator("mat-dialog-container, ion-modal")
+            )).last
+            submit_label = re.compile(
+                r"^(?:Book|Reserve|Confirm(?: booking)?|Book parking space|Reservar|Confirmar(?: reserva)?)$", re.I
+            )
+        dialog.wait_for(timeout=10_000)
+        submit = visible(dialog.get_by_role("button", name=submit_label))
         text = dialog.inner_text()
-        hours = intervals(text)
-        whole_day_shown = all_day and not INTERVAL.search(text) and shows_all_day(text)
+        details = text
+        if choice.material:
+            details = "\n".join(line for line in text.splitlines() if normalized(line) != normalized(space))
+        hours = intervals(details)
+        whole_day_shown = all_day and not INTERVAL.search(details) and shows_all_day(details)
         shown_vehicle = {normalized(value) for value in field_values(text, r"Vehicle|Vehículo")}
+        shown_dates = dates(details, self.day_first)
+        right_date = shown_dates == {day}
+        right_hours = hours == {span} or whole_day_shown
+        space_labels = r"Parking space|Space|Plaza|Resource|Recurso"
+        right_space = shows(text, space_labels, space)
+        if choice.material:
+            # The named resource dialog may omit date and hours. They were
+            # checked in the form and the exact row that opened this dialog.
+            heading = visible(dialog.locator("h2"))
+            right_space = (heading.count() == 1 and normalized(heading.inner_text()) == normalized(space)
+                           and (not list(field_values(text, space_labels)) or right_space))
+            if not shown_dates:
+                right_date = not re.search(r"\b(?:Date|Fecha)\b|(?<!\d)\d{1,2}/\d{1,2}", details, re.I)
+            if not hours:
+                right_hours = whole_day_shown or not re.search(rf"\b(?:Time|Schedule|Horario)\b|{TIME}", details, re.I)
+            expected = torres_shifts(day, building, floor)
+            if expected and hours == set(expected):
+                right_hours = True
         if (
             submit.count() != 1 or not submit.is_enabled()
-            or dates(text, self.day_first) != {day}
+            or not right_date
             or not all(span)
-            or (hours != {span} and not whole_day_shown)
-            or not shows(text, r"Building|Edificio", building)
-            or not shows(text, r"Floor|Planta", floor)
-            or not shows(text, r"Parking space|Space|Plaza|Resource|Recurso", space)
+            or not right_hours
+            or not shows_location(text, building, floor)
+            or not right_space
             or (shown_vehicle and shown_vehicle != {normalized(vehicle)})
         ):
             raise BookingProblem("Bookker's final selection did not verify one space, date, location and full interval.")
@@ -820,14 +969,18 @@ def parking_dates(records, form):
 
 
 def verify_booking(records, selection, form, recovered):
+    day = date.fromisoformat(selection.date)
+    shifts = torres_shifts(day, selection.building, selection.floor)
+    span = (selection.start_time, selection.end_time)
+
     def matches(record):
         shown_hours = intervals(record)
         return (
-            dates(record, form.day_first) == {date.fromisoformat(selection.date)}
-            and (shown_hours == {(selection.start_time, selection.end_time)}
+            dates(record, form.day_first) == {day}
+            and (shown_hours == {span}
+                 or (shifts and span == (shifts[0][0], shifts[-1][1]) and shown_hours == set(shifts))
                  or (selection.all_day and not INTERVAL.search(record) and shows_all_day(record)))
-            and shows(record, r"Building|Edificio", selection.building)
-            and shows(record, r"Floor|Planta", selection.floor)
+            and shows_location(record, selection.building, selection.floor)
             and shows(record, r"Parking space|Space|Plaza|Resource|Recurso", selection.space)
         )
 
@@ -854,7 +1007,7 @@ def verify_booking(records, selection, form, recovered):
 
 
 def book_parking(client, *, building, floor, from_date, whole_day, spot_name, spot_id,
-                 confirm_click, submission_state, result_file):
+                 confirm_click, submission_state, result_file, on_date=None):
     if not whole_day or not building or not floor:
         return outcome("blocked", "Whole-day parking needs an explicit building and floor.",
                        "Rerun with --whole-day, --building and --floor.")
@@ -862,6 +1015,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
         return outcome("blocked", "A confirmed run requires a persistent submission state path.",
                        "Supply --submission-state and reuse that path for retries.")
 
+    expected_shifts = torres_shifts(on_date, building, floor)
     pending = None
     if submission_state is not None:
         try:
@@ -872,6 +1026,18 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             return outcome("unknown", "The saved submission intent could not be read.", RECONCILE)
     if pending and (pending.building != building or pending.floor != floor):
         return outcome("unknown", "The saved submission intent is for a different location.", RECONCILE)
+    if pending and on_date and pending.date != on_date.isoformat():
+        return outcome("unknown", "The saved submission intent is for a different date.", RECONCILE)
+    if pending and expected_shifts and (
+        (pending.start_time, pending.end_time) != (expected_shifts[0][0], expected_shifts[-1][1])
+        or pending.all_day
+    ):
+        return outcome("unknown", "The saved submission intent does not verify both requested parking shifts.",
+                       RECONCILE)
+    today = datetime.now(ZoneInfo(MADRID)).date()
+    if not pending and on_date and on_date < today:
+        return outcome("unavailable", "The requested local date has passed in Europe/Madrid.",
+                       "Check Bookker Bookings for any reservation already made for the requested date.")
 
     phase = "open the browser with the saved session"
     submitted_or_pending = pending is not None
@@ -888,30 +1054,45 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             phase = "reload Bookings and reconcile the saved submission"
             records = form.bookings(client.base_url, date.fromisoformat(pending.date), reload=True)
             return verify_booking(records, pending, form, recovered=True)
-        earliest = max(from_date or FIRST_DAY, FIRST_DAY, datetime.now(ZoneInfo(MADRID)).date())
+        earliest = on_date or max(from_date or FIRST_DAY, FIRST_DAY, today)
         vehicle = None
         while True:
-            phase = "open the parking form to check the next offered date"
+            phase = "open the parking form to check the requested date"
             vehicle = form.open(building, floor, vehicle)
             phase = "read the local date from Bookker's offered calendar"
-            day = form.next_date(earliest)
+            day = form.next_date(earliest, exact=on_date is not None)
             if day is None:
+                if on_date:
+                    return outcome("unavailable", "Bookker did not offer the requested local date.",
+                                   "Check the requested date in the Bookker parking calendar.")
                 return outcome("unavailable", "No eligible whole-day space was found in Bookker's offered window.",
                                "Retry when Bookker opens more dates or availability changes.")
-            earliest = day + timedelta(days=1)
+            if on_date:
+                if day != on_date:
+                    raise BookingProblem("Bookker offered a different date from the exact date requested.",
+                                         "Check the requested date in the Bookker parking calendar.")
+            else:
+                earliest = day + timedelta(days=1)
             phase = "read the account's Bookings for the candidate date"
             records = form.bookings(client.base_url, day, reload=False)
             if day in parking_dates(records, form):
+                if on_date:
+                    return outcome("unavailable", "Bookker already shows a parking booking for the requested date.",
+                                   "Check the existing reservation in Bookker Bookings for that date.")
                 continue
             phase = "reopen the parking form after checking Bookings"
             form.open(building, floor, vehicle)
             phase = "restore the candidate date after checking Bookings"
-            if form.next_date(day) != day:
+            if form.next_date(day, exact=on_date is not None) != day:
                 raise BookingProblem("Bookker stopped offering the candidate date after the Bookings check.",
                                      "Check the offered date in the Bookker parking form before rerunning.")
             phase = "select one interval covering the displayed parking shifts"
-            schedule = form.whole_day()
+            schedule = form.whole_day(expected_shifts)
             if schedule is None:
+                if on_date:
+                    required = "07:00–14:00 and 14:00–23:00" if expected_shifts else "all required parking shifts"
+                    return outcome("unavailable", f"Bookker did not offer {required} on the requested date.",
+                                   "Check shift availability for the requested date in the Bookker parking form.")
                 continue
             span, all_day = schedule
             phase = "search for an available parking space"
@@ -919,11 +1100,17 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             form.location("Floor", floor, select=False)
             form.selected_vehicle(vehicle)
             form.check_repeat()
-            space = form.select_space(floor, span, spot_name, spot_id)
-            if space is None:
+            if on_date:
+                form.check_date(day)
+            choice = form.select_space(building, floor, span, spot_name, spot_id,
+                                       require_material=bool(expected_shifts))
+            if choice is None:
+                if on_date:
+                    return outcome("unavailable", "No parking space covered the full interval on the requested date.",
+                                   "Check availability for the full interval and requested location in Bookker.")
                 continue
             phase = "verify the final parking selection"
-            selection, submit = form.review(day, span, all_day, building, floor, space, vehicle)
+            selection, submit = form.review(day, span, all_day, building, floor, choice, vehicle)
             if not confirm_click:
                 return {
                     **outcome("blocked", "Dry run reached a verified selection.",

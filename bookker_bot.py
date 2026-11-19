@@ -259,12 +259,13 @@ class BookkerClient:
         building: Optional[str] = None,
         floor: Optional[str] = None,
         from_date: Optional[date] = None,
+        on_date: Optional[date] = None,
         whole_day: bool = False,
         submission_state: Optional[Path] = None,
         result_file: Optional[Path] = None,
     ) -> Dict[str, Any]:
         return book_parking(
-            self, building=building, floor=floor, from_date=from_date,
+            self, building=building, floor=floor, from_date=from_date, on_date=on_date,
             whole_day=whole_day, spot_name=spot_name, spot_id=spot_id,
             confirm_click=confirm_click, submission_state=submission_state,
             result_file=result_file,

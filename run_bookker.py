@@ -28,7 +28,9 @@ def main():
     ap.add_argument("--slowmo", type=int, default=0, help="Slow motion ms")
     ap.add_argument("--building")
     ap.add_argument("--floor")
-    ap.add_argument("--from-date", type=iso_date, metavar="YYYY-MM-DD")
+    ap.add_argument("--from-date", type=iso_date, metavar="YYYY-MM-DD", help="Earliest day to search")
+    ap.add_argument("--on-date", type=iso_date, metavar="YYYY-MM-DD",
+                    help="Book only this date, overriding --from-date")
     ap.add_argument("--whole-day", action="store_true", help="Cover all displayed parking shifts")
     ap.add_argument("--spot-name")
     ap.add_argument("--spot-id")
@@ -70,7 +72,7 @@ def main():
     try:
         if args.cmd == "book":
             result = client.book(
-                building=args.building, floor=floor, from_date=args.from_date,
+                building=args.building, floor=floor, from_date=args.from_date, on_date=args.on_date,
                 whole_day=args.whole_day, spot_name=args.spot_name, spot_id=args.spot_id,
                 submission_state=args.submission_state, confirm_click=args.confirm,
                 result_file=args.result_file,
