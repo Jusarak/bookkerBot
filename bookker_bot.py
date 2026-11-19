@@ -50,7 +50,7 @@ class BookkerClient:
         api_host_hint: Optional[str] = os.environ.get("BOOKKER_API_HOST_HINT", "execute-api.eu-west-1.amazonaws.com"),
         headless: bool = True,
         slow_mo_ms: int = 0,
-        channel: str = os.environ.get("PLAYWRIGHT_CHANNEL", "msedge"),   # <- Edge by default
+        channel: Optional[str] = os.environ.get("PLAYWRIGHT_CHANNEL", "msedge"),
     ):
         self.base_url = base_url
         self.auth_state_path = Path(auth_state_path)
@@ -143,7 +143,7 @@ class BookkerClient:
         print(f"[bookker] Saved auth to {self.auth_state_path.resolve()}")
         self.close()
 
-    def open_with_session(self, *, timezone_id: Optional[str] = None):
+    def open_with_session(self, *, timezone_id: Optional[str] = None, wait_for_idle: bool = True):
         """
         Opens Edge reusing stored session (no 2FA while valid).
         """
@@ -152,7 +152,8 @@ class BookkerClient:
         self._launch(storage_state=str(self.auth_state_path), timezone_id=timezone_id)
         assert self.page
         self.page.goto(self.base_url, wait_until="domcontentloaded")
-        self.page.wait_for_load_state("networkidle", timeout=15_000)
+        if wait_for_idle:
+            self.page.wait_for_load_state("networkidle", timeout=15_000)
 
     # ---------- availability capture ----------
 

@@ -1,0 +1,34 @@
+[Unit]
+Description=Bookker scheduled parking release
+Documentation=file:/home/marcos/workspace/code/bookkerBot/README.md
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=marcos
+Group=marcos
+WorkingDirectory=/home/marcos/workspace/code/bookkerBot
+EnvironmentFile=-/etc/bookker-parking.env
+ExecStart=/home/marcos/workspace/code/bookkerBot/.venv/bin/python -B parking_release.py run
+StateDirectory=bookker-parking
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=3min
+TimeoutStopSec=5s
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bookker-parking
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectClock=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+AmbientCapabilities=

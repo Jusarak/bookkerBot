@@ -74,3 +74,8 @@ make offline-parking-tests
 
 The fixtures exercise the normal CLI using synthetic bookings and browser
 controls. The Bookings DOM callback test also uses Node.js when available.
+
+## Scheduled parking on Debian
+
+[Scheduled parking deployment and verification](deploy/README.md) covers the
+Debian oneshot, the generated calendar timer, offline traces and operator checks.

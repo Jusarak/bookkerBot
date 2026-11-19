@@ -177,6 +177,10 @@ class MissingBookingDetailsLink(BookingProblem):
     """A verified Bookings row has no visible details action."""
 
 
+class ReleaseClosed(Exception):
+    """A scheduled action would fall outside its release window."""
+
+
 def outcome(status, reason, next_action, *, observation=None):
     result = {"outcome": status, "reason": reason, "next_action": next_action}
     if observation:
@@ -554,6 +558,21 @@ class ParkingForm:
         if login_route or login.count():
             raise BookingProblem("Bookker requires sign-in.", SIGN_IN)
 
+    def check_authenticated(self, base_url):
+        def check_location():
+            current, expected = urlsplit(self.page.url), urlsplit(base_url)
+            if (current.scheme, current.netloc) != (expected.scheme, expected.netloc):
+                raise BookingProblem("Bookker redirected to sign-in.", SIGN_IN)
+            self.check_session()
+
+        check_location()
+        try:
+            self.navigation("Bookings").first.wait_for(timeout=10_000)
+        except Exception:
+            check_location()
+            raise BookingProblem("Bookker's authenticated navigation could not be verified.") from None
+        check_location()
+
     def navigation(self, name):
         # Material icons can be included in the link's accessible name.
         link = self.page.get_by_role("link", name=re.compile(rf"\b{name}\b", re.I))
@@ -605,7 +624,7 @@ class ParkingForm:
     def parking_step(self, reason, next_action):
         try:
             yield
-        except BookingProblem:
+        except (BookingProblem, ReleaseClosed):
             raise
         except Exception:
             try:
@@ -676,7 +695,7 @@ class ParkingForm:
             raise BookingProblem("Bookker did not show the same selected account vehicle.", action)
         return selected
 
-    def next_date(self, earliest, *, exact=False):
+    def next_date(self, earliest, *, exact=False, on_dispatch=None):
         control = self.control("Date")
         native = control.locator("input[type=date]").or_(control.and_(
             self.page.locator("input[type=date]")
@@ -690,10 +709,12 @@ class ParkingForm:
                 return None
             if exact and not native.is_editable():
                 return None
+            if on_dispatch:
+                on_dispatch("date_dispatch")
             native.fill(candidate.isoformat())
             native.press("Tab")
         else:
-            candidate = self.calendar_date(control, earliest, exact=exact)
+            candidate = self.calendar_date(control, earliest, exact=exact, on_dispatch=on_dispatch)
             if candidate is None:
                 return None
         self.settled()
@@ -705,11 +726,13 @@ class ParkingForm:
             raise BookingProblem("Bookker did not retain the requested local date.",
                                  "Check the selected date in the Bookker parking form.")
 
-    def calendar_date(self, control, earliest, *, exact=False):
+    def calendar_date(self, control, earliest, *, exact=False, on_dispatch=None):
         calendar_button = re.compile(r"calendar|date|calendario", re.I)
         toggle = visible(control.get_by_role("button", name=calendar_button))
         if toggle.count() != 1:
             toggle = visible(control.locator("xpath=..").get_by_role("button", name=calendar_button))
+        if on_dispatch:
+            on_dispatch("calendar_dispatch")
         (toggle if toggle.count() == 1 else control).click()
         calendar = visible(self.page.locator("mat-calendar").or_(self.page.get_by_role("grid"))).first
         calendar.wait_for()
@@ -756,6 +779,8 @@ class ParkingForm:
                         and cell.is_enabled() and not cell.evaluate(
                             "(el) => !!el.closest('[aria-disabled=true], .mat-calendar-body-disabled')"
                         )):
+                    if on_dispatch:
+                        on_dispatch("date_dispatch")
                     cell.click()
                     return day
             if exact and month >= earliest.replace(day=1):
@@ -824,7 +849,7 @@ class ParkingForm:
                 shifts[end][1].click()
         return (start[0], end[1]), use_all_day
 
-    def select_space(self, building, floor, span, spot_name, spot_id, *, require_material=False):
+    def select_space(self, building, floor, span, spot_name, spot_id, *, require_material=False, on_dispatch=None):
         random_booking = visible(self.page.get_by_role(
             "switch", name=re.compile(r"random (?:parking )?space|plaza aleatoria", re.I)
         ))
@@ -842,7 +867,8 @@ class ParkingForm:
             if not search.is_enabled():
                 return None
             search.focus(timeout=10_000)
-            search.press("Enter", timeout=10_000)
+            timeout = on_dispatch("refresh_dispatch") if on_dispatch else 10_000
+            search.press("Enter", timeout=timeout)
             self.settled()
         if self.label(NO_SPACES).count():
             return None
@@ -878,7 +904,8 @@ class ParkingForm:
                 return None
         material_rows = row_locator.all()
         if material_rows:
-            return self.select_material_space(material_rows, building, floor, span, spot_name, spot_id)
+            return self.select_material_space(material_rows, building, floor, span, spot_name, spot_id,
+                                              settle=on_dispatch is None)
         if require_material:
             raise BookingProblem("Bookker did not show a readable list of named parking resources.",
                                  "Check the parking results list for named spaces with location and hours.")
@@ -921,13 +948,14 @@ class ParkingForm:
                 row.click()
             else:
                 raise BookingProblem("Bookker did not show a separate control for selecting the parking space.")
-            self.settled()
+            if on_dispatch is None:
+                self.settled()
             return SpaceChoice(name)
         if rows and not unknown_availability:
             return None
         raise BookingProblem("Bookker did not expose a verifiable list of available parking spaces.")
 
-    def select_material_space(self, rows, building, floor, span, spot_name, spot_id):
+    def select_material_space(self, rows, building, floor, span, spot_name, spot_id, *, settle=True):
         unreadable = False
         for row in rows:
             text = row.inner_text()
@@ -964,14 +992,15 @@ class ParkingForm:
             with self.parking_step("The named parking resource could not be opened for review.",
                                    "Check the named resource in the Bookker parking results list."):
                 choose.click(timeout=10_000)
-                self.settled()
+                if settle:
+                    self.settled()
             return SpaceChoice(name, material=True)
         if unreadable:
             raise BookingProblem("Bookker showed parking rows without readable names, controls or hours.",
                                  "Check the named spaces and their availability in the Bookker list.")
         return None
 
-    def review(self, day, span, all_day, building, floor, choice, vehicle):
+    def review(self, day, span, all_day, building, floor, choice, vehicle, *, verify_all=False):
         space = choice.name
         if choice.material:
             dialog = visible(self.page.locator("mat-dialog-container"))
@@ -985,6 +1014,8 @@ class ParkingForm:
             )
         dialog.wait_for(timeout=10_000)
         submit = visible(dialog.get_by_role("button", name=submit_label))
+        if verify_all:
+            submit.first.wait_for(timeout=10_000)
         text = dialog.inner_text()
         details = text
         if choice.material:
@@ -994,7 +1025,7 @@ class ParkingForm:
         shown_vehicle = {normalized(value) for value in field_values(text, r"Vehicle|Vehículo")}
         shown_dates = dates(details, self.day_first)
         right_date = shown_dates == {day}
-        right_hours = hours == {span} or whole_day_shown
+        right_hours = hours == {span} or whole_day_shown or (verify_all and shift_span(hours - {span}) == span)
         space_labels = r"Parking space|Space|Plaza|Resource|Recurso"
         right_space = shows(text, space_labels, space)
         if choice.material:
@@ -1039,7 +1070,7 @@ class ParkingForm:
         details = scope if scope is not self.page else self.page.locator("body")
         return action, details.inner_text(timeout=1000)
 
-    def wait_for_submission(self, before, *, watch_final):
+    def wait_for_submission(self, before, *, watch_final, verify_prompt=None):
         deadline = monotonic() + 15
         baseline = {normalized(line) for line in before.splitlines()}
         last_prompt, stable_since = None, None
@@ -1067,7 +1098,10 @@ class ParkingForm:
                 prompt = None
             text = prompt[1] if prompt else None
             now = monotonic()
-            if text != last_prompt:
+            if verify_prompt:
+                if text and verify_prompt(text):
+                    return "Bookker displayed a separate final confirmation step.", text
+            elif text != last_prompt:
                 last_prompt, stable_since = text, now
             elif text and now - stable_since >= 1:
                 return "Bookker displayed a separate final confirmation step.", text
@@ -1084,7 +1118,7 @@ class ParkingForm:
             return "Bookker displayed an unrecognized status message after submission.", None
         return "Bookker showed no recognized response within the wait period.", None
 
-    def verify_final_prompt(self, selection, vehicle, expected_text):
+    def verify_final_prompt(self, selection, vehicle, expected_text, *, verify_all=False):
         prompt = self.final_prompt()
         if not prompt:
             return None
@@ -1097,7 +1131,7 @@ class ParkingForm:
         if (
             text != expected_text or not action.is_enabled(timeout=1000)
             or dates(details, self.day_first) != {day}
-            or not shows_interval(details, selection)
+            or not shows_interval(details, selection, verify_all=verify_all)
             or not shows_location(text, selection.building, selection.floor)
             or spaces.keys() != {normalized(selection.space)}
             or (vehicles and vehicles != {normalized(vehicle)})
@@ -1455,19 +1489,19 @@ def parking_dates(records, form):
     )), form)
 
 
-def shows_interval(record, selection):
+def shows_interval(record, selection, *, verify_all=False):
     day = date.fromisoformat(selection.date)
     shifts = required_shifts(day, selection.building, selection.floor)
     span = (selection.start_time, selection.end_time)
     shown_hours = intervals(record)
     return (shown_hours == {span}
             or (shifts and span == (shifts[0][0], shifts[-1][1]) and shown_hours - {span} == set(shifts))
-            or (not shifts and is_superficie(selection.building, selection.floor)
+            or (not shifts and (verify_all or is_superficie(selection.building, selection.floor))
                 and shift_span(shown_hours - {span}) == span)
             or (selection.all_day and not INTERVAL.search(record) and shows_all_day(record)))
 
 
-def verify_booking(records, selection, form, recovered, *, base_url=None, observation=None):
+def verify_booking(records, selection, form, recovered, *, base_url=None, observation=None, verify_all=False):
     day = date.fromisoformat(selection.date)
     location = selection.building, selection.floor
     space_names = {normalized(selection.space)}
@@ -1483,7 +1517,7 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
         return shows_location(record, *location)
 
     def complete(record):
-        return shows_interval(record, selection) and matching_location(record)
+        return shows_interval(record, selection, verify_all=verify_all) and matching_location(record)
 
     def has_hours(record):
         return INTERVAL.search(record) or shows_all_day(record) or list(field_values(record, r"Time|Schedule|Horario"))
@@ -1557,7 +1591,7 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
                 or (other_days and other_days != {day})
                 or (other_spaces and other_spaces.keys() != space_names)
                 or (has_location(other) and not matching_location(other))
-                or (has_hours(other) and not shows_interval(other, selection))
+                or (has_hours(other) and not shows_interval(other, selection, verify_all=verify_all))
                 or any(not CONFIRMED_STATUS.fullmatch(status) for status in booking_statuses(other))
             )
             if not conflicting:
@@ -1600,15 +1634,17 @@ def superficie_request(day, building, floor):
     return request
 
 
-def observe_submit(form, submit, before, *, watch_final):
+def observe_submit(form, submit, before, *, watch_final, dispatch=None, verify_prompt=None):
+    timeout = dispatch() if dispatch else 5000
     click_error = False
     try:
-        submit.click(timeout=5000)
+        submit.click(timeout=timeout)
     except Exception:
         # A browser error can arrive after Bookker receives the click.
         click_error = True
     try:
-        message, final_prompt = form.wait_for_submission(before, watch_final=watch_final)
+        options = {"verify_prompt": verify_prompt} if verify_prompt else {}
+        message, final_prompt = form.wait_for_submission(before, watch_final=watch_final, **options)
     except Exception:
         message, final_prompt = "The Bookker response could not be read after the action.", None
     if click_error:
@@ -1617,13 +1653,15 @@ def observe_submit(form, submit, before, *, watch_final):
 
 
 def book_parking(client, *, building, floor, from_date, whole_day, spot_name, spot_id,
-                 confirm_click, submission_state, result_file, on_date=None):
+                 confirm_click, submission_state, result_file, on_date=None, release=None):
     if not whole_day or not building or not floor:
         return outcome("blocked", "Whole-day parking needs an explicit building and floor.",
                        "Rerun with --whole-day, --building and --floor.")
     if confirm_click and submission_state is None:
         return outcome("blocked", "A confirmed run requires a persistent submission state path.",
                        "Supply --submission-state and reuse that path for retries.")
+    if release and on_date is None:
+        raise ValueError("Scheduled parking requires an exact date")
 
     expected_shifts = required_shifts(on_date, building, floor)
     is_surface = is_superficie(building, floor)
@@ -1648,7 +1686,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
     ):
         return outcome("unknown", "The saved submission intent does not verify both requested parking shifts.",
                        RECONCILE)
-    today = datetime.now(ZoneInfo(MADRID)).date()
+    today = release.local_today if release else datetime.now(ZoneInfo(MADRID)).date()
     if not pending and on_date and on_date < today:
         return outcome("unavailable", "The requested local date has passed in Europe/Madrid.",
                        "Check Bookker Bookings for any reservation already made for the requested date.")
@@ -1667,21 +1705,29 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
         write_json(result_file, data)
 
     selection = pending
+    dispatch = {"on_dispatch": release.dispatch} if release else {}
+    verification = {"verify_all": True} if release else {}
     try:
         if pending and result_file is not None:
             phase = "mark the saved submission as pending reconciliation"
             write_pending(pending)
             phase = "open the browser with the saved session"
-        client.open_with_session(timezone_id=MADRID)
+        launch_options = {"wait_for_idle": False} if release else {}
+        client.open_with_session(timezone_id=MADRID, **launch_options)
         form = ParkingForm(client.page)
         phase = "check whether Bookker requires sign-in"
-        form.check_session()
+        if release:
+            form.check_authenticated(client.base_url)
+        else:
+            form.check_session()
         if pending:
             phase = "reload Bookings and reconcile the saved submission"
             day = date.fromisoformat(pending.date)
             records = form.bookings(client.base_url, day, reload=True, include_inactive=True)
-            reconciled = verify_booking(records, pending, form, recovered=True, base_url=client.base_url)
-            if (reconciled["outcome"] == "confirmed" or not confirm_click or not torres_shifts(on_date, building, floor)
+            reconciled = verify_booking(records, pending, form, recovered=True, base_url=client.base_url,
+                                        **verification)
+            if (release or reconciled["outcome"] == "confirmed" or not confirm_click
+                    or not torres_shifts(on_date, building, floor)
                     or day < today or not retry_authorized(submission_state, digest)):
                 return {**selected_details(pending), **reconciled}
             active = (record for record in records if not (
@@ -1695,19 +1741,30 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                                RECONCILE)
             spot_name = pending.space
         earliest = on_date or max(from_date or FIRST_DAY, FIRST_DAY, today)
-        bookings_checked = bool(on_date and is_surface and not pending)
+        bookings_checked = bool(on_date and (is_surface or release) and not pending)
         if bookings_checked:
             phase = "read the account's Bookings for the requested date"
             records = form.bookings(client.base_url, on_date, reload=False)
             if on_date in parking_dates(records, form):
-                return outcome("unavailable", "Bookker already shows a parking booking for the requested date.",
+                return outcome("already_booked" if release else "unavailable",
+                               "Bookker already shows a parking booking for the requested date.",
                                "Check the existing reservation in Bookker Bookings for that date.")
         vehicle = None
         while True:
             phase = "open the parking form to check the requested date"
             vehicle = form.open(building, floor, vehicle)
+            if release:
+                form.check_repeat()
+                release.wait()
             phase = "read the local date from Bookker's offered calendar"
-            day = form.next_date(earliest, exact=on_date is not None)
+            day = form.next_date(earliest, exact=on_date is not None, **dispatch)
+            if release and day is None:
+                # A calendar loaded before release can still carry the old horizon.
+                release.dispatch("form_refresh_dispatch")
+                form.page.reload(wait_until="domcontentloaded", timeout=10_000)
+                form.check_authenticated(client.base_url)
+                form.open(building, floor, vehicle)
+                day = form.next_date(earliest, exact=True, **dispatch)
             if day is None:
                 if on_date:
                     return outcome("unknown" if pending else "unavailable",
@@ -1736,7 +1793,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                     raise BookingProblem("Bookker stopped offering the candidate date after the Bookings check.",
                                          "Check the offered date in the Bookker parking form before rerunning.")
             phase = "select one interval covering the displayed parking shifts"
-            schedule = (form.whole_day(expected_shifts, verify_all=True) if is_surface
+            schedule = (form.whole_day(expected_shifts, verify_all=True) if is_surface or release
                         else form.whole_day(expected_shifts))
             if schedule is None:
                 if on_date:
@@ -1756,7 +1813,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             if on_date:
                 form.check_date(day)
             choice = form.select_space(building, floor, span, spot_name, spot_id,
-                                       require_material=bool(expected_shifts) or is_surface)
+                                       require_material=bool(expected_shifts) or is_surface, **dispatch)
             if choice is None:
                 if on_date:
                     reason = ("The saved space was unavailable for the full interval on the requested date." if pending
@@ -1765,7 +1822,7 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                                    "Check availability for the full interval and requested location in Bookker.")
                 continue
             phase = "verify the final parking selection"
-            selection, submit = form.review(day, span, all_day, building, floor, choice, vehicle)
+            selection, submit = form.review(day, span, all_day, building, floor, choice, vehicle, **verification)
             if pending and selection != pending:
                 raise BookingProblem("The reviewed selection differed from the saved submission intent.")
             if not confirm_click:
@@ -1781,6 +1838,8 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             phase = "capture the view before the Book action"
             watch_final = choice.material and form.final_prompt() is None
             before = form.submission_text()
+            if release:
+                release.remaining()
             phase = "persist the retry claim" if pending else "persist the submission intent"
             try:
                 if pending:
@@ -1796,13 +1855,17 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             except FileExistsError:
                 return outcome("unknown", "Another run recorded the submission intent or retry claim.", RECONCILE)
             submitted_or_pending = True
-            observation["book"], prompt = observe_submit(form, submit, before, watch_final=watch_final)
+            first_dispatch = (lambda: release.dispatch("submit_dispatch")) if release else None
+            verify_prompt = (lambda text: form.verify_final_prompt(selection, vehicle, text,
+                                                                  **verification)) if release else None
+            observation["book"], prompt = observe_submit(form, submit, before, watch_final=watch_final,
+                                                         dispatch=first_dispatch, verify_prompt=verify_prompt)
             if result_file is not None:
                 phase = "record the redacted response to Book"
                 write_pending(selection)
             if prompt:
                 phase = "verify the separate final confirmation in Bookker"
-                final = form.verify_final_prompt(selection, vehicle, prompt)
+                final = form.verify_final_prompt(selection, vehicle, prompt, **verification)
                 if final is None:
                     observation["final_confirmation"] = "The final confirmation details could not be verified."
                 else:
@@ -1820,8 +1883,9 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
                     except FileExistsError:
                         observation["final_confirmation"] = "A final confirmation claim already exists."
                     else:
+                        final_dispatch = (lambda: release.dispatch("final_submit_dispatch")) if release else None
                         observation["final_confirmation"], _ = observe_submit(
-                            form, final, final_before, watch_final=False,
+                            form, final, final_before, watch_final=False, dispatch=final_dispatch,
                         )
                 if result_file is not None:
                     phase = "record the redacted final confirmation response"
@@ -1830,9 +1894,16 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
             records = form.bookings(client.base_url, day, reload=True, include_inactive=True)
             return {**selected_details(selection),
                     **verify_booking(records, selection, form, recovered=False, base_url=client.base_url,
-                                     observation=observation),
+                                     observation=observation, **verification),
                     "submission_observation": observation}
+    except ReleaseClosed:
+        return outcome("unknown" if submitted_or_pending else "missed",
+                       "The scheduled release window closed before the next action.",
+                       RECONCILE if submitted_or_pending else "Check the next scheduled occurrence.",
+                       observation=observation)
     except BookingProblem as error:
+        if release and error.next_action == SIGN_IN:
+            return outcome("auth_required", error.reason, SIGN_IN, observation=observation)
         status = "unknown" if submitted_or_pending else "blocked"
         action = error.next_action
         if submitted_or_pending:
@@ -1840,6 +1911,8 @@ def book_parking(client, *, building, floor, from_date, whole_day, spot_name, sp
         return {**selected_details(selection), **outcome(status, error.reason, action, observation=observation)}
     except FileNotFoundError:
         if phase == "open the browser with the saved session":
+            if release and not client.auth_state_path.is_file():
+                return outcome("auth_required", "The saved Bookker session is missing.", SIGN_IN)
             return outcome("unknown" if submitted_or_pending else "blocked",
                            "The saved Bookker session is missing.",
                            f"{SIGN_IN} {RECONCILE}" if submitted_or_pending else SIGN_IN)
