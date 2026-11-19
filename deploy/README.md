@@ -370,12 +370,19 @@ synthetic Gmail message once per expired state, suppresses the second alert,
 and picks up the newly installed state on its next run. Real relay delivery,
 Android MFA, host activation and live Bookker submission are operator checks.
 
-The Debian 13 `systemd-analyze calendar` check ran offline. Earlier offline
-verification with `systemd-analyze verify` passed for the three checked-in
-units and the generated example timer in a disposable Debian 13 root with
-systemd 257.13. That root supplied the host unit dependencies and executables
-at the configured installation paths, including `/usr/sbin/nft` and the
-checkout's `.venv/bin/python`. Installation and startup are operator steps. In the
-implementation sandbox, unit verification stopped during working-directory
-setup with `Read-only file system`. Complete the unit, firewall and Tailscale
-checks on the target host.
+The Debian 13 `systemd-analyze calendar` check ran offline. The controller
+recorded both required checks passing with exit code 0 at
+`654fb940e51553f7637ff41c1e86a8a22791ba29`.
+
+- `offline-tests` ran `/usr/bin/python3 -B -m unittest discover`.
+- `offline-systemd-units` ran `systemd-analyze verify` for
+  `bookker-parking.service`, `bookker-renewal.socket`, `bookker-renewal.service`
+  and the worker-generated example timer in a disposable Debian 13 root.
+  The fixture supplied the host unit dependencies and executables at the
+  configured paths, including `/usr/sbin/nft` and
+  `/home/marcos/workspace/code/bookkerBot/.venv/bin/python`.
+
+The earlier disposable-root verification used systemd 257.13. A separate
+attempt in the implementation sandbox stopped during working-directory setup
+with `Read-only file system`. Installation, startup and the unit, firewall and
+Tailscale checks on the target host are operator steps.
