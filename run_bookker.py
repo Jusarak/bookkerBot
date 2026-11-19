@@ -5,7 +5,7 @@ from datetime import date
 from pathlib import Path
 
 from bookker_bot import BookkerClient
-from parking_booking import write_json
+from parking_booking import SUBMISSION_SIDECARS, write_json
 
 
 def iso_date(value):
@@ -42,9 +42,15 @@ def main():
     if args.cmd == "book":
         paths = [Path(args.auth), args.submission_state, args.result_file]
         paths = [path.resolve() for path in paths if path is not None]
+        if args.submission_state is not None:
+            try:
+                paths.extend(args.submission_state.with_suffix(suffix).resolve() for suffix in SUBMISSION_SIDECARS)
+            except ValueError:
+                ap.error("Use a file path for --submission-state.")
         protected = {Path.cwd() / ".env", Path.cwd() / "auth_state.json"}
         if len(set(paths)) != len(paths) or protected.intersection(paths[1:]):
-            ap.error("Use distinct paths for --auth, --submission-state and --result-file, with neither output using a session or environment file")
+            ap.error("Use distinct paths for --auth, --submission-state, its sidecars and --result-file. "
+                     "Keep output separate from session and environment files.")
         if args.result_file is not None:
             try:
                 write_json(args.result_file, {

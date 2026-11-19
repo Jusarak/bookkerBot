@@ -8,13 +8,15 @@ import sys
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import run_bookker
 from parking_booking import (
-    BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, NO_BOOKINGS, TORRES_SHIFTS, BookingProblem,
+    BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, NO_BOOKINGS, RETRY_ATTEMPT,
+    RETRY_FINAL_ATTEMPT, RETRY_PERMISSION, TORRES_SHIFTS, BookingProblem,
     ParkingForm, Selection, SpaceChoice, dates, intervals, parking_dates, period_covers, read_intent, verify_booking,
     write_json,
 )
@@ -41,12 +43,15 @@ class OfflineForm:
         self.clicks = 0
         self.timeout = False
         self.exact_dates = []
+        self.events = []
+        self.after_book = ("Bookker showed no recognized response within the wait period.", None)
 
     def check_session(self):
         pass
 
     def bookings(self, base_url, day, *, reload):
         self.bookings_reads.append((day.day, reload))
+        self.events.append("reload" if reload else "read")
         return self.after_submit if reload else self.existing
 
     def open(self, building, floor, vehicle):
@@ -95,8 +100,20 @@ class OfflineForm:
         self.selection = Selection(day.isoformat(), *span, building, floor, choice.name, all_day)
         return self.selection, self
 
-    def click(self):
+    def submission_text(self):
+        return self.vehicle
+
+    def final_prompt(self):
+        return None
+
+    def wait_for_submission(self, before, *, watch_final):
+        self.events.append("observe")
+        assert before == self.vehicle
+        return self.after_book if watch_final else (self.after_book[0], None)
+
+    def click(self, *, timeout):
         self.clicks += 1
+        self.events.append("book")
         assert read_intent(self.intent) == self.selection
         assert json.loads(self.receipt.read_text())["outcome"] == "unknown"
         if self.timeout:
@@ -113,6 +130,8 @@ Status: Confirmed
 Confirmation reference: OFFLINE-123
 Vehicle: private fixture vehicle
 """
+EXACT_ARGS = ("--on-date", "2026-11-26")
+EXACT_MATCH = MATCH.replace("November 23", "November 26")
 
 
 class ParkingCommandTests(unittest.TestCase):
@@ -266,6 +285,154 @@ class ParkingCommandTests(unittest.TestCase):
                 launch.assert_not_called()
                 self.assertEqual(json.loads(self.form.receipt.read_text())["outcome"], "unknown")
                 self.assertEqual(json.loads(self.form.intent.read_text()), intent)
+
+    def authorize_retry(self):
+        # Include formatting absent from write_json to test binding to file bytes.
+        intent = {
+            "version": 1, "date": "2026-11-26", "start_time": "07:00", "end_time": "23:00",
+            "building": "NEWTON", "floor": "Parking Torres Quevedo", "space": "PTQ-123", "all_day": False,
+        }
+        original = (" \n" + json.dumps(intent) + "\n\n").encode()
+        self.form.intent.write_bytes(original)
+        marker = self.form.intent.with_suffix(RETRY_PERMISSION)
+        write_json(marker, {
+            "version": 1, "action": "retry-identical-selection-once",
+            "original_intent_sha256": sha256(original).hexdigest(), "at": "2026-11-20T10:00:00+01:00",
+            "basis": "offline reconciliation fixture",
+        })
+        return original, marker
+
+    def test_retry_checks_bookings_searches_saved_space_and_waits_once(self):
+        original, marker = self.authorize_retry()
+        marking = marker.read_bytes()
+        claim = self.form.intent.with_suffix(RETRY_ATTEMPT)
+        select = self.form.select_space
+        click = self.form.click
+
+        def check_claim(**kwargs):
+            saved = json.loads(claim.read_text())
+            self.assertEqual(saved["original_intent_sha256"], sha256(original).hexdigest())
+            click(**kwargs)
+
+        self.form.after_book = ("Bookker reported a booking date or booking window restriction.", None)
+        with patch.object(self.form, "select_space", wraps=select) as choose, patch.object(self.form, "click", check_claim):
+            result = self.run_command(*EXACT_ARGS, "--confirm")
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(result["submission_observation"]["book"], self.form.after_book[0])
+        choose.assert_called_once_with("NEWTON", "Parking Torres Quevedo", ("07:00", "23:00"),
+                                       "PTQ-123", None, require_material=True)
+        self.assertEqual(self.form.events, ["reload", "book", "observe", "reload"])
+        self.assertEqual(self.form.bookings_reads, [(26, True), (26, True)])
+        self.assertEqual(self.form.intent.read_bytes(), original)
+        self.assertEqual(marker.read_bytes(), marking)
+        self.form.events.clear()
+        self.assertEqual(self.run_command(*EXACT_ARGS, "--confirm")["outcome"], "unknown")
+        self.assertEqual(self.form.events, ["reload"])
+        self.form.after_submit = [EXACT_MATCH]
+        self.assertEqual(self.run_command(*EXACT_ARGS, "--confirm")["outcome"], "confirmed")
+        self.assertEqual(self.form.clicks, 1)
+
+    def test_retry_requires_confirm_exact_date_and_permission_for_original_bytes(self):
+        original, marker = self.authorize_retry()
+        self.assertEqual(self.run_command(*EXACT_ARGS)["outcome"], "unknown")
+        self.assertEqual(self.run_command("--confirm")["outcome"], "unknown")
+        self.form.intent.write_bytes(original + b" ")
+        self.assertEqual(self.run_command(*EXACT_ARGS, "--confirm")["outcome"], "unknown")
+        self.form.intent.write_bytes(original)
+        marker.write_text("broken JSON")
+        self.assertEqual(self.run_command(*EXACT_ARGS, "--confirm")["outcome"], "unknown")
+        self.assertEqual(self.form.days, [])
+        self.assertEqual(self.form.bookings_reads, [(26, True)] * 4)
+        self.assertFalse(self.form.intent.with_suffix(RETRY_ATTEMPT).exists())
+
+    def test_retry_stops_for_a_competing_or_unreadable_booking(self):
+        self.authorize_retry()
+        for row, reason in (("Type: Desk\nNovember 26, 2026", "already showed a booking"),
+                            ("Type: Parking\nunreadable date", "local date could not be verified")):
+            with self.subTest(row=row):
+                self.form.after_submit = [row]
+                result = self.run_command(*EXACT_ARGS, "--confirm")
+                self.assertEqual(result["outcome"], "unknown")
+                self.assertIn(reason, result["reason"])
+        self.assertEqual(self.form.days, [])
+        self.assertFalse(self.form.intent.with_suffix(RETRY_ATTEMPT).exists())
+
+    def test_retry_preserves_intent_on_changed_selection_or_claim_race(self):
+        original, _ = self.authorize_retry()
+        with patch.object(self.form, "select_space", return_value=SpaceChoice("PTQ-124", material=True)):
+            result = self.run_command(*EXACT_ARGS, "--confirm")
+        self.assertIn("reviewed selection differed", result["reason"])
+        claim = self.form.intent.with_suffix(RETRY_ATTEMPT)
+        self.assertFalse(claim.exists())
+
+        def competing_claim(path, data, *, exclusive=False):
+            if path == claim:
+                write_json(claim, {"claimed": True}, exclusive=True)
+            return write_json(path, data, exclusive=exclusive)
+
+        with patch("parking_booking.write_json", competing_claim):
+            result = self.run_command(*EXACT_ARGS, "--confirm")
+        self.assertIn("Another run", result["reason"])
+        self.assertEqual(self.form.clicks, 0)
+        self.assertEqual(self.form.intent.read_bytes(), original)
+
+    def test_retry_claim_bounds_a_distinct_verified_final_action(self):
+        self.authorize_retry()
+        self.form.after_book = ("Bookker displayed a separate final confirmation step.", EXACT_MATCH)
+        final_claim = self.form.intent.with_suffix(RETRY_FINAL_ATTEMPT)
+
+        def confirm(**kwargs):
+            self.form.events.append("confirm")
+            self.assertTrue(final_claim.is_file())
+            self.assertNotIn(self.form.vehicle, final_claim.read_text())
+            self.form.after_book = ("Bookker displayed a booking acknowledgement.", None)
+            self.form.after_submit = [EXACT_MATCH]
+
+        final = Mock()
+        final.click.side_effect = confirm
+        with patch.object(self.form, "verify_final_prompt", create=True, return_value=final) as verify:
+            result = self.run_command(*EXACT_ARGS, "--confirm")
+            verify.assert_called_once_with(self.form.selection, self.form.vehicle, EXACT_MATCH)
+            self.assertEqual(self.form.events, ["reload", "book", "observe", "confirm", "observe", "reload"])
+            self.assertEqual(result["outcome"], "confirmed")
+            self.assertEqual(result["submission_observation"]["final_confirmation"], self.form.after_book[0])
+            self.run_command(*EXACT_ARGS, "--confirm")
+            final.click.assert_called_once()
+            self.assertEqual(self.form.clicks, 1)
+
+    def test_retry_does_not_click_an_unverified_final_prompt(self):
+        self.authorize_retry()
+        self.form.after_book = ("Bookker displayed a separate final confirmation step.", "Confirm booking")
+        with patch.object(self.form, "verify_final_prompt", create=True, return_value=None):
+            result = self.run_command(*EXACT_ARGS, "--confirm")
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertIn("could not be verified", result["submission_observation"]["final_confirmation"])
+        self.assertEqual(self.form.events, ["reload", "book", "observe", "reload"])
+        self.assertFalse(self.form.intent.with_suffix(RETRY_FINAL_ATTEMPT).exists())
+
+    def test_retry_acknowledgement_needs_a_bookings_match(self):
+        self.authorize_retry()
+        self.form.after_book = ("Bookker displayed a booking acknowledgement.", None)
+        result = self.run_command(*EXACT_ARGS, "--confirm")
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertEqual(result["submission_observation"]["book"], self.form.after_book[0])
+
+    def test_receipt_keeps_redacted_observation_when_bookings_reload_fails(self):
+        self.authorize_retry()
+        self.form.after_book = ("Bookker displayed an error or refused the booking action.", None)
+        with patch.object(self.form, "bookings", side_effect=[[], TimeoutError(self.form.vehicle)]):
+            result = self.run_command(*EXACT_ARGS, "--confirm")
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertIn("reload Bookings", result["reason"])
+        self.assertEqual(result["submission_observation"]["book"], self.form.after_book[0])
+
+    def test_result_path_cannot_clobber_retry_permission(self):
+        _, marker = self.authorize_retry()
+        saved = marker.read_bytes()
+        with (patch.object(sys, "argv", self.args + ["--result-file", str(marker)]),
+              contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
+            run_bookker.main()
+        self.assertEqual(marker.read_bytes(), saved)
 
     def test_missing_auth_reports_sign_in_from_real_entry_point(self):
         command = [sys.executable, *self.args, "--confirm"]
@@ -811,6 +978,55 @@ class ParkingCommandTests(unittest.TestCase):
         result = verify_booking([record], selection, self.form, recovered=True)
         self.assertEqual(result["outcome"], "confirmed")
         self.assertEqual((result["start_time"], result["end_time"]), ("07:00", "23:00"))
+
+    def test_submission_wait_reads_new_feedback_without_logging_page_text(self):
+        page = Mock()
+        form = ParkingForm(page)
+        before = "Booking limit information\n" + self.form.vehicle
+        notice = before + "\nThe selected date is not eligible for " + self.form.vehicle
+        with patch.object(form, "submission_text", side_effect=[before, TimeoutError(), notice]):
+            result, prompt = form.wait_for_submission(before, watch_final=False)
+        self.assertEqual(result, "Bookker reported a booking date or booking window restriction.")
+        self.assertIsNone(prompt)
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+        page.goto.assert_not_called()
+
+    def test_submission_wait_requires_a_stable_follow_on_prompt(self):
+        page = Mock()
+        form = ParkingForm(page)
+        action = Mock()
+        elapsed = 0.0
+
+        def advance(ms):
+            nonlocal elapsed
+            elapsed += ms / 1000
+
+        page.wait_for_timeout.side_effect = advance
+        with (patch("parking_booking.monotonic", side_effect=lambda: elapsed),
+              patch.object(form, "submission_text", return_value="Please confirm your booking"),
+              patch.object(form, "final_prompt", side_effect=[(action, "loading")] + [(action, EXACT_MATCH)] * 5)):
+            result, prompt = form.wait_for_submission("Book", watch_final=True)
+        self.assertEqual(result, "Bookker displayed a separate final confirmation step.")
+        self.assertEqual(prompt, EXACT_MATCH)
+        self.assertEqual(elapsed, 1.25)
+        page.goto.assert_not_called()
+
+    def test_final_confirmation_requires_the_same_visible_selection(self):
+        page = Mock()
+        page.locator.return_value.get_attribute.return_value = "en"
+        form = ParkingForm(page)
+        selection = Selection("2026-11-26", "07:00", "23:00", "NEWTON", "Parking Torres Quevedo", "PTQ-123")
+        action = Mock()
+        with patch.object(form, "final_prompt", return_value=(action, EXACT_MATCH)):
+            self.assertIs(form.verify_final_prompt(selection, self.form.vehicle, EXACT_MATCH), action)
+            self.assertIsNone(form.verify_final_prompt(selection, self.form.vehicle, "changed since observed"))
+        for old, new in (("November 26", "November 27"), ("11:00 PM", "02:00 PM"), ("PTQ-123", "PTQ-124"),
+                         ("NEWTON", "OTHER"), ("Parking Torres Quevedo", "Visitor Parking"),
+                         (self.form.vehicle, "other vehicle"), ("Type: Parking", "Type: Parking\nRepeat: Weekly")):
+            edited = EXACT_MATCH.replace(old, new)
+            with self.subTest(edited=edited), patch.object(form, "final_prompt", return_value=(action, edited)):
+                self.assertIsNone(form.verify_final_prompt(selection, self.form.vehicle, edited))
+        action.click.assert_not_called()
 
     def test_review_rejects_partial_interval_and_multiple_spaces(self):
         page = Mock()
