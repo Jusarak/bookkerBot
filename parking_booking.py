@@ -123,6 +123,8 @@ BOOKINGS_PERIOD_REASON = "The Bookings period could not be verified for the cand
 CHECK_BOOKINGS_PERIOD = "Check the Bookings period filter for a range that includes the intended date."
 STATUS_FIELD = r"(?:Booking )?Status|Estado(?: de la reserva)?"
 SPACE_FIELD = r"Parking space|Space|Plaza|Resource|Recurso"
+LOCATION_FIELD = r"Building|Edificio|Floor|Planta|Location|Ubicación"
+LOCATION_ICON = re.compile(r"^(?:location_on\s*|place(?:\s+|$))", re.I)
 REFERENCE_FIELD = (r"Reference|Confirmation(?: (?:reference|code|number|ID))?|"
                    r"Booking (?:reference|number|ID)|Reservation (?:reference|number|ID)|"
                    r"Referencia(?: de (?:reserva|confirmación))?")
@@ -377,17 +379,32 @@ def shows(text, labels, value):
     return any(normalized(part) == normalized(value) for part in fields(text))
 
 
-def card_location(text):
-    # Bookker renders adjacent schedule and location spans on a single line.
-    for line in text.splitlines():
-        schedule = re.match(r"^\s*schedule\s*", line, re.I)
+def card_locations(text):
+    locations = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        line = line.strip()
+        icon = LOCATION_ICON.match(line)
+        if icon:
+            value = line[icon.end():]
+            if not value and index + 1 < len(lines):
+                value = lines[index + 1]
+            locations.append(value.strip())
+            continue
+        # Adjacent schedule and location spans can share a line with a trailing floor detail.
+        schedule = re.match(r"^schedule\s*", line, re.I)
         hours = INTERVAL.match(line, schedule.end()) if schedule else None
         if hours:
-            location = re.sub(r"^\s*(?:location_on\s*)?", "", line[hours.end():], flags=re.I)
+            location = line[hours.end():].strip()
+            icon = LOCATION_ICON.match(location)
+            if icon:
+                location = location[icon.end():]
             parts = [part.strip() for part in location.split(",")]
             if len(parts) in (2, 3) and all(parts[:2]):
-                return parts[0], parts[1]
-    return None
+                locations.append(", ".join(parts[:2]))
+            elif icon:
+                locations.append(location)
+    return locations
 
 
 def shows_location(text, building, floor):
@@ -408,14 +425,12 @@ def shows_location(text, building, floor):
         full_values = {normalized(value) for value in field_values(text, building_labels, split_inline=False)}
         if not combined <= full_values or any(not pair.fullmatch(value) for value in combined):
             return False
-    lines = [re.sub(r"^(?:location_on\s*|place\s+)", "", normalized(line)) for line in text.splitlines()]
-    labelled = list(field_values("\n".join(lines), r"Location|Ubicación", split_inline=False))
-    if labelled:
-        return all(pair.fullmatch(line) for line in labelled)
+    locations = card_locations(text) + list(field_values(text, r"Location|Ubicación", split_inline=False))
+    if locations:
+        return all(pair.fullmatch(normalized(LOCATION_ICON.sub("", value))) for value in locations)
     return (bool(combined)
             or (shows(text, building_labels, building) and shows(text, floor_labels, floor))
-            or any(pair.fullmatch(line) for line in lines)
-            or tuple(map(normalized, card_location(text) or ())) == (building_name, floor_name))
+            or any(pair.fullmatch(normalized(line)) for line in text.splitlines()))
 
 
 def booking_space(text):
@@ -1407,8 +1422,8 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
             return True
         if base_url is None:
             return False
-        has_location = (list(field_values(record, r"Building|Edificio|Floor|Planta|Location|Ubicación"))
-                        or re.search(r"^\s*(?:location_on|place\s)|(?:[,/·]\s*parking\s+\w)", record, re.M | re.I))
+        has_location = (list(field_values(record, LOCATION_FIELD)) or card_locations(record)
+                        or re.search(r"[,/·]\s*parking\s+\w", record, re.I))
         return not has_location or matching_location(record)
 
     matches = [record for record in records if matches(record)]
