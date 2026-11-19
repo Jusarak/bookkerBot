@@ -40,6 +40,10 @@ NO_BOOKINGS = re.compile(
     r"(?: selected)?)?"
     r"(?: yet)?[.!]?$", re.I,
 )
+BOOKING_ROWS = (
+    "tbody tr, [role=row]:not(:has([role=columnheader])), "
+    "[data-testid=booking], [data-testid=booking-row], [data-testid=booking-card]"
+)
 CONFIRMED_STATUS = re.compile(r"confirmed|booked|reserved|approved|confirmad[ao]|reservad[ao]|aprobad[ao]", re.I)
 INACTIVE = re.compile(r"cancelled|canceled|expired|rejected|rechazad[ao]|cancelad[ao]|caducad[ao]", re.I)
 UNVERIFIED_STATUS = re.compile(r"pending(?: approval)?|requested|pendiente(?: de aprobación)?", re.I)
@@ -591,14 +595,14 @@ class ParkingForm:
             raise BookingProblem("The Bookings navigation link did not reach the Bookings view.",
                                  "Open Bookings from Bookker's visible navigation and check the view.")
 
-    def select_booking_period(self, day):
+    def select_booking_period(self, day, view):
         page = self.page
-        combo = page.get_by_role("combobox")
-        period = visible(page.get_by_label(re.compile(r"^(?:Booking )?(?:Period|Date range)$", re.I)))
+        combo = view.get_by_role("combobox")
+        period = visible(view.get_by_label(re.compile(r"^(?:Booking )?(?:Period|Date range)$", re.I)))
         if not period.count():
             period = visible(combo.filter(has_text=PERIOD).or_(combo.filter(has_text=DATE_TEXT)))
         if not period.count():
-            period = visible(page.get_by_role("button", name=PERIOD))
+            period = visible(view.get_by_role("button", name=PERIOD))
         today = datetime.now(ZoneInfo(MADRID)).date()
         day_first = self.day_first
 
@@ -619,7 +623,7 @@ class ParkingForm:
                 return period.inner_text()
 
             if covers(selected_period()):
-                return
+                return period
             if native:
                 for option in period.locator("option").all():
                     label = option.evaluate("el => el.label")
@@ -636,7 +640,7 @@ class ParkingForm:
                         break
             self.settled()
             if covers(selected_period()):
-                return
+                return period
         except Exception:
             self.check_session()
             raise problem from None
@@ -657,41 +661,59 @@ class ParkingForm:
             self.check_session()
             if not self.in_bookings():
                 self.open_bookings()
-        upcoming = self.label(re.compile(r"^(?:Upcoming(?: bookings)?|Próximas(?: reservas)?)$", re.I))
+        view = visible(self.page.locator("app-bookings"))
+        views = view.count()
+        if views > 1:
+            raise BookingProblem("Bookker showed multiple active Bookings views.")
+        if not views:
+            main = visible(self.page.get_by_role("main"))
+            view = main if main.count() == 1 else self.page
+
+        upcoming = self.label(re.compile(r"^(?:Upcoming(?: bookings)?|Próximas(?: reservas)?)$", re.I), view)
         if upcoming.count():
             upcoming.click()
             self.settled()
-        self.select_booking_period(day)
+        period = self.select_booking_period(day, view)
         self.check_session()
         if not self.in_bookings():
             raise BookingProblem("Bookker left the Bookings view while selecting the period.")
 
-        view = self.page
-        main = visible(view.get_by_role("main"))
-        if main.count() == 1:
-            view = main
-        rows = visible(view.locator(
-            "tbody tr, [role=row]:not(:has([role=columnheader])), "
-            "[data-testid=booking], [data-testid=booking-row], [data-testid=booking-card], "
-            "mat-card, [role=listitem], article"
-        ))
+        navigation = ":is(nav, aside, [role=navigation], [role=complementary])"
+        content = view.locator(f":not({navigation}, {navigation} *)")
+        rows = visible(view.locator(f"{BOOKING_ROWS}, mat-card, [role=listitem], article").and_(content))
+        empty = visible(view.get_by_text(NO_BOOKINGS).and_(content)).first
+        period_text = re.escape(normalized(period.inner_text()))
+        period_layout = rf"(?:(?:booking )?(?:period|date range)\s*:?\s*)?(?:{period_text})?"
         result = []
         seen = set()
         while True:
             # Some views nest a card inside a list item. Read only the outer row.
-            texts = rows.evaluate_all("""rows => rows
+            cards = rows.evaluate_all("""(rows, bookingRows) => rows
                 .filter(row => !rows.some(other => row !== other && other.contains(row)))
-                .map(row => row.innerText.trim())""")
+                .map(row => [row.innerText.trim(),
+                    row.matches(bookingRows) || row.querySelector(bookingRows) !== null])""", BOOKING_ROWS)
+            empty_text = normalized(empty.inner_text()) if empty.count() else ""
+            layout = period_layout
+            if empty_text:
+                marker = re.escape(empty_text)
+                layout = rf"(?:{layout}|{layout}\s*{marker}|{marker}\s*{layout})"
+            # A generic card can wrap the filter and empty marker. Ignore it
+            # only when every visible word belongs to those controls.
+            texts = [text for text, explicit in cards
+                     if text and (explicit or not re.fullmatch(layout, normalized(text)))]
+            if empty_text and texts:
+                raise BookingProblem("Bookker showed row content alongside its Bookings empty state.",
+                                     "Check which reservations are shown for the selected period in Bookker.")
+            if not texts and not empty_text:
+                raise BookingProblem("Bookker did not show a readable Bookings list or empty state.",
+                                     "Check the Bookings list for the selected period in Bookker.")
             snapshot = tuple(texts)
             if snapshot in seen:
                 raise BookingProblem("Bookker's Bookings list did not advance to another page.")
             seen.add(snapshot)
-            records = [text for text in texts if text and not any(
+            records = [text for text in texts if not any(
                 INACTIVE.fullmatch(part) for part in booking_statuses(text)
             )]
-            if not texts and not self.label(NO_BOOKINGS, view).count():
-                raise BookingProblem("Bookker did not show a readable Bookings list or empty state.",
-                                     "Check the Bookings list for the selected period in Bookker.")
             result.extend(records)
             following = visible(view.get_by_role(
                 "button", name=re.compile(r"^(?:Next page|Página siguiente)$", re.I)

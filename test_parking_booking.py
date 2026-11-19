@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import run_bookker
 from parking_booking import (
     NO_BOOKINGS, BookingProblem, ParkingForm, Selection, dates, intervals, period_covers,
-    read_intent, verify_booking, write_json,
+    parking_dates, read_intent, verify_booking, write_json,
 )
 
 
@@ -225,13 +225,17 @@ class ParkingCommandTests(unittest.TestCase):
         day = date(2026, 11, 23)  # Next week in Madrid.
         period = page.get_by_label.return_value.filter.return_value
         period.evaluate.side_effect = [False]
-        period.inner_text.side_effect = ["This week", "Next week"]
+        period.inner_text.side_effect = ["This week", "Next week", "Next week"]
         option = Mock()
         option.inner_text.return_value = "Next week"
         page.get_by_role.return_value.or_.return_value.filter.return_value.all.return_value = [option]
-        page.locator.return_value.filter.return_value.evaluate_all.return_value = []
+        page.locator.return_value.filter.return_value.count.return_value = 0
+        page.locator.return_value.and_.return_value.filter.return_value.evaluate_all.return_value = []
+        empty = page.get_by_text.return_value.and_.return_value.filter.return_value.first
+        empty.count.return_value = 1
+        empty.inner_text.return_value = "info You do not have any bookings for the selected period yet"
         with patch("parking_booking.datetime", RunDate), patch.object(form, "check_session"), patch.object(
-            form, "label", side_effect=[Mock(**{"count.return_value": 0}), Mock(**{"count.return_value": 1})]
+            form, "label", return_value=Mock(**{"count.return_value": 0})
         ):
             page.get_by_role.return_value.filter.return_value.count.return_value = 0
             page.get_by_role.return_value.filter.return_value.first.count.return_value = 0
@@ -241,6 +245,44 @@ class ParkingCommandTests(unittest.TestCase):
         page.reload.assert_called_once()
         period.click.assert_called_once()
         option.click.assert_called_once()
+
+    def test_bookings_card_wrapping_the_period_and_empty_state(self):
+        page = Mock(url="https://bookker.test/#/bookings")
+        view = page.locator.return_value.filter.return_value
+        view.count.return_value = 1
+        period = view.get_by_label.return_value.filter.return_value
+        period.evaluate.return_value = False
+        period.inner_text.return_value = "This week"
+        empty = view.get_by_text.return_value.and_.return_value.filter.return_value.first
+        empty.count.return_value = 1
+        empty.inner_text.return_value = "info You do not have any bookings for the selected period yet"
+        view.get_by_role.return_value.filter.return_value.first.count.return_value = 0
+        cards = view.locator.return_value.and_.return_value.filter.return_value
+        wrapper = f"Period\nThis week\n{empty.inner_text.return_value}"
+        cards.evaluate_all.return_value = [(wrapper, False)]
+        form = ParkingForm(page)
+        day = date(2026, 11, 20)
+
+        with patch("parking_booking.datetime", RunDate), patch.object(form, "check_session"), patch.object(
+            form, "label", return_value=Mock(**{"count.return_value": 0})
+        ):
+            records = form.bookings("https://bookker.test/", day, reload=False)
+            self.assertEqual(parking_dates(records, form), set())
+            page.get_by_text.assert_not_called()
+            view.get_by_text.assert_called_with(NO_BOOKINGS)
+
+            for rows in ([(wrapper, False), (MATCH, True)], [(f"{wrapper}\n{MATCH}", False)]):
+                with self.subTest(rows=rows):
+                    cards.evaluate_all.return_value = rows
+                    with self.assertRaisesRegex(BookingProblem, "alongside its Bookings empty state"):
+                        form.bookings("https://bookker.test/", day, reload=False)
+
+            empty.count.return_value = 0
+            cards.evaluate_all.return_value = [("Period\nThis week", False)]
+            with self.assertRaisesRegex(BookingProblem, "did not show a readable Bookings list or empty state"):
+                form.bookings("https://bookker.test/", day, reload=False)
+            cards.evaluate_all.return_value = [(MATCH, False)]
+            self.assertEqual(form.bookings("https://bookker.test/", day, reload=False), [MATCH])
 
     def test_named_and_explicit_bookings_periods_cover_the_candidate(self):
         today = date(2026, 11, 20)
