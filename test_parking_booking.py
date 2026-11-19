@@ -168,6 +168,7 @@ class CancellationFixture:
         self.reads = []
         self.linked = {}
         self.detail_reads = []
+        self.titles = {}
         self.page = Mock()
         self.row = locator(text=self.target)
         self.trigger = locator()
@@ -196,8 +197,11 @@ class CancellationFixture:
         return self.records.copy()
 
     def booking_row(self, base_url, day, record):
-        assert record == self.target
-        return self.row
+        assert record in self.records
+        row = self.row if record == self.target else locator(text=record)
+        row.locator.return_value = locator()
+        row.locator.return_value.all_inner_texts.return_value = self.titles.get(record, [])
+        return row
 
     def booking_details(self, base_url, day, record, space):
         self.detail_reads.append(record)
@@ -302,14 +306,22 @@ class CancellationCommandTests(unittest.TestCase):
         # After the interrupted action, the same reservation can still be
         # present in a card that no longer displays the reference.
         readback = "November 26, 2026\nPTQ-123"
+        self.form.titles[readback] = ["PTQ-123"]
         self.form.linked[readback] = linked
         self.form.delete.click.side_effect = lambda **kwargs: self.form.records.__setitem__(0, readback)
         args = ("--reference", "OFFLINE-123", "--confirm", "--submission-state", str(self.state))
-        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
-        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
-        self.assertEqual(self.form.detail_reads, [sparse, sparse, sparse, readback, readback])
+        for _ in range(2):
+            self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.assertEqual(self.form.detail_reads, [sparse] * 3 + [readback] * 4)
         self.form.delete.click.assert_called_once()
         self.assertEqual(self.form.records, [readback, self.form.neighbor])
+
+        duplicate = readback + "\nStatus: Confirmed"
+        self.form.records.append(duplicate)
+        self.form.titles[duplicate] = ["PTQ-123"]
+        self.form.linked[duplicate] = linked
+        self.assertIn("More than one", self.run_command(*args)["reason"])
+        self.form.delete.click.assert_called_once()
 
     def test_reference_only_in_linked_details(self):
         row = "November 26, 2026\nSpace: PTQ-123\nNEWTON, Parking Torres Quevedo"
@@ -318,6 +330,44 @@ class CancellationCommandTests(unittest.TestCase):
         self.assertEqual(self.run_command("--reference", "OFFLINE-123")["outcome"], "preview")
         self.assertEqual(self.form.detail_reads, [row])
         self.form.trigger.click.assert_not_called()
+
+    def test_sparse_resource_title_must_agree_with_linked_space(self):
+        sparse = "November 26, 2026\nPTQ-124"
+        self.form.records = [sparse]
+        self.form.target = sparse
+        self.form.row.inner_text.return_value = sparse
+        self.form.titles[sparse] = ["PTQ-124"]
+        linked = "NEWTON, Parking Torres Quevedo\nReference: OFFLINE-123\nSpace: "
+        self.form.linked[sparse] = linked + "PTQ-124"
+        args = ("--reference", "OFFLINE-123")
+        self.assertEqual(self.run_command(*args)["space"], "PTQ-124")
+
+        self.form.linked[sparse] = linked + "PTQ-123"
+        for index, selector in enumerate((args, self.selector)):
+            with self.subTest(selector=selector):
+                state = self.state.with_name(f"cancel-{index}.json")
+                result = self.run_command(*selector, "--confirm", "--submission-state", str(state))
+                self.assertEqual(result["outcome"], "blocked")
+                self.assertIn("conflicting spaces", result["reason"])
+                self.assertFalse(state.exists())
+        self.form.trigger.click.assert_not_called()
+
+    def test_reference_lookup_and_readback_allow_readable_reference_free_neighbor(self):
+        neighbor = self.form.neighbor.replace("\nConfirmation reference: OFFLINE-124", "")
+        self.form.records[1] = neighbor
+        self.form.linked[neighbor] = "Space: PTQ-124\nNEWTON, Parking Torres Quevedo"
+        args = ("--reference", "OFFLINE-123")
+        self.assertEqual(self.run_command(*args)["outcome"], "preview")
+        args += ("--confirm", "--submission-state", str(self.state))
+        self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+        self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+
+        self.form.linked[neighbor] = ""
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.form.linked.clear()
+        self.assertEqual(self.run_command(*args)["outcome"], "unknown")
+        self.assertEqual(self.form.records, [neighbor])
+        self.form.delete.click.assert_called_once()
 
     def test_missing_space_on_saved_cancellation_is_resolved_before_reporting_absence(self):
         row = "November 26, 2026\nNEWTON, Parking Torres Quevedo"
@@ -414,6 +464,28 @@ class CancellationCommandTests(unittest.TestCase):
         self.assertEqual(self.run_command(*args)["outcome"], "unknown")
         self.form.delete.click.assert_called_once()
         self.form.final_delete.click.assert_not_called()
+
+    def test_confirmation_checks_schedule_and_location_text(self):
+        locations = (
+            ("NEWTON, Parking Superficie C", "unknown"),
+            ("OTHER BUILDING, Parking Torres Quevedo", "unknown"),
+            ("NEWTON, Parking Superficie C\nBuilding: NEWTON\nFloor: Parking Torres Quevedo", "unknown"),
+            ("NEWTON, Parking Torres Quevedo", "cancelled"),
+        )
+        for index, (location, expected) in enumerate(locations):
+            with self.subTest(location=location):
+                self.form = CancellationFixture()
+                self.form.prompt(f"Delete this booking?\nschedule 07:00–23:00location_on {location}\nDelete")
+                result = self.run_command(*self.selector, "--confirm", "--submission-state",
+                                          str(self.state.with_name(f"cancel-{index}.json")))
+                self.assertEqual(result["outcome"], expected)
+                if expected == "unknown":
+                    self.assertIn("different reservation", result["reason"])
+                    self.form.final_delete.click.assert_not_called()
+                    self.assertEqual(self.form.records, [self.form.target, self.form.neighbor])
+                else:
+                    self.form.final_delete.click.assert_called_once()
+                    self.assertEqual(self.form.records, [self.form.neighbor])
 
 
 class ParkingCommandTests(unittest.TestCase):

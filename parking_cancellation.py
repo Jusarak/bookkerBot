@@ -93,38 +93,45 @@ def reservation_details(record, target, requested_location, form, base_url, day)
     references = booking_references(record)
     hours = intervals(record)
     linked = ""
+    titles = {}
     if not (location and space and days) or (target.reference and not references):
-        linked = form.booking_details(base_url, day, record, space)
+        row = form.booking_row(base_url, day, record)
+        names = visible(row.locator(
+            ".resource-name, .booking-name, [data-testid=booking-space], a .strong, [role=link] .strong"
+        ))
+        for name in names.all_inner_texts():
+            name = name.strip()
+            if re.fullmatch(SPACE_CODE, name):
+                titles[normalized(name)] = name
+        title = next(iter(titles.values())) if len(titles) == 1 else ""
+        linked = form.booking_details(base_url, day, record, title or space)
+        if not linked.strip():
+            raise BookingProblem("Bookker did not display readable details for the matching reservation.",
+                                 CANCEL_CHECK)
+        references |= booking_references(linked)
+        space = space or title or space_in(linked)
+
+    if target.reference and target.reference not in references:
+        return None
+    if linked:
         linked_location = location_in(linked)
         if linked_location and location and not shows_location(linked, *location):
             raise BookingProblem("The linked booking details showed a different location.", CANCEL_CHECK)
         location = location or linked_location
-        space = space or space_in(linked)
         days |= dates(linked, form.day_first)
-        references |= booking_references(linked)
         hours = hours or intervals(linked)
 
-    if target.reference and not references:
-        raise BookingProblem("A possible reservation did not show a verifiable reference.", CANCEL_CHECK)
-    if target.reference and target.reference not in references:
-        return None
-    if not space:
-        row = form.booking_row(base_url, day, record)
-        name = visible(row.locator(".resource-name, .booking-name, [data-testid=booking-space], [role=link] .strong"))
-        if name.count() == 1:
-            candidate = name.inner_text(timeout=1000).strip()
-            if re.fullmatch(SPACE_CODE, candidate) and shows(record, SPACE_FIELD, candidate):
-                space = candidate
+    # The linked panel can omit fields already shown on the card.
+    if ((titles and titles.keys() != {normalized(space)})
+            or any(list(field_values(text, SPACE_FIELD)) and not shows(text, SPACE_FIELD, space)
+                   for text in (record, linked))):
+        raise BookingProblem("A possible matching Bookings row showed conflicting spaces.", CANCEL_CHECK)
     if target.space and space and normalized(target.space) != normalized(space):
         return None
     if not location or not space:
         raise BookingProblem("Bookker did not show the parking space and location for the selected reservation.",
                              CANCEL_CHECK)
     building, floor = location
-    # The linked panel can omit fields already shown on the card.
-    if any(list(field_values(text, SPACE_FIELD)) and not shows(text, SPACE_FIELD, space)
-           for text in (record, linked)):
-        raise BookingProblem("A possible matching Bookings row showed conflicting spaces.", CANCEL_CHECK)
     text = f"{record}\n{linked}"
     if (len(days) != 1 or (day is not None and days != {day}) or len(references) > 1
             or not shows_location(f"{text}\nBuilding: {building}\nFloor: {floor}", building, floor)):
@@ -195,12 +202,16 @@ def confirm_cancellation(dialogs, details, *, day_first, needs_occurrence_choice
     shown_spaces = {normalized(value) for value in field_values(text, SPACE_FIELD)}
     shown_references = booking_references(text)
     shown_location = list(field_values(text, r"Building|Edificio|Floor|Planta|Location|Ubicación"))
+    combined_location = card_location(text)
+    expected_location = details["building"], details["floor"]
     shown_hours = intervals(text)
     known_hours = {tuple(span) for span in details.get("displayed_intervals", [])}
     if ((shown_days and shown_days != {date.fromisoformat(details["date"])})
             or (shown_spaces and shown_spaces != {normalized(details["space"])})
             or (shown_references and shown_references != {details.get("confirmation_reference")})
-            or (shown_location and not shows_location(text, details["building"], details["floor"]))
+            or (shown_location and not shows_location(text, *expected_location))
+            or (combined_location and tuple(map(normalized, combined_location))
+                != tuple(map(normalized, expected_location)))
             or (shown_hours and shown_hours != known_hours)):
         raise BookingProblem("The cancellation dialog showed details for a different reservation.", CANCEL_CHECK)
 
