@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import run_bookker
 from parking_booking import (
-    BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, NO_BOOKINGS, RETRY_ATTEMPT,
+    BOOKING_ARTICLE, BOOKING_LIST_ROWS, BOOKING_LOADING, FINAL_ATTEMPT, NO_BOOKINGS, RETRY_ATTEMPT,
     RETRY_FINAL_ATTEMPT, RETRY_PERMISSION, SUPERFICIE_SATURDAY_SHIFTS, TORRES_SHIFTS, BookingProblem,
     ParkingForm, Selection, SpaceChoice, dates, intervals, parking_dates, period_covers, read_intent, verify_booking,
     write_json,
@@ -331,6 +331,30 @@ class CancellationCommandTests(unittest.TestCase):
         self.assertEqual(self.form.detail_reads, [row])
         self.form.trigger.click.assert_not_called()
 
+    def test_linked_reference_checks_card_hours_before_cancelling(self):
+        row = ("November 26, 2026\nPTQ-123\n07:00–14:00\n"
+               "NEWTON, Parking Torres Quevedo")
+        self.form.records[0] = self.form.target = row
+        self.form.row.inner_text.return_value = row
+        details = "Space: PTQ-123\nReference: OFFLINE-123\n"
+        args = ("--reference", "OFFLINE-123", "--confirm", "--submission-state", str(self.state))
+        self.form.linked[row] = details + "14:00–23:00"
+        result = self.run_command(*args)
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertIn("different hours", result["reason"])
+        self.assertEqual(self.form.records, [row, self.form.neighbor])
+        self.assertFalse(self.state.exists())
+        self.form.trigger.click.assert_not_called()
+        self.form.delete.click.assert_not_called()
+
+        self.form.linked[row] = details + "07:00–10:00\n10:00–14:00"
+        self.assertEqual(self.run_command("--reference", "OFFLINE-123")["outcome"], "preview")
+        self.form.linked[row] = details + "7:00 AM–2:00 PM"
+        self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+        self.assertEqual(self.run_command(*args)["outcome"], "cancelled")
+        self.assertEqual(self.form.records, [self.form.neighbor])
+        self.form.delete.click.assert_called_once()
+
     def test_sparse_resource_title_must_agree_with_linked_space(self):
         sparse = "November 26, 2026\nPTQ-124"
         self.form.records = [sparse]
@@ -504,11 +528,17 @@ class CancellationCommandTests(unittest.TestCase):
         self.form.final_delete.click.assert_not_called()
 
     def test_conflicting_row_location_blocks_cancellation_before_menu(self):
-        for layout_index, layout in enumerate(("schedule 07:00–23:00location_on ", "")):
+        conflicts = (
+            "schedule 07:00–23:00location_on NEWTON, Parking Superficie C",
+            "NEWTON, Parking Superficie C",
+            "NEWTON (Parking Superficie C)",
+            "Parking Torres Quevedo (OTHER BUILDING)",
+        )
+        for layout_index, location in enumerate(conflicts):
             for selector_index, selector in enumerate((self.selector, ("--reference", "OFFLINE-123"))):
-                with self.subTest(layout=layout, selector=selector):
+                with self.subTest(location=location, selector=selector):
                     self.form = CancellationFixture()
-                    row = f"{self.form.target}\n{layout}NEWTON, Parking Superficie C"
+                    row = f"{self.form.target}\n{location}"
                     self.form.records[0] = self.form.target = row
                     self.form.row.inner_text.return_value = row
                     state = self.state.with_name(f"cancel-{layout_index}-{selector_index}.json")
@@ -518,6 +548,14 @@ class CancellationCommandTests(unittest.TestCase):
                     self.assertEqual(self.form.records, [row, self.form.neighbor])
                     self.assertFalse(state.exists())
                     self.form.trigger.click.assert_not_called()
+
+    def test_parenthesized_row_location_resolves_for_reference_selector(self):
+        row = "November 26, 2026\nPTQ-123\nNEWTON (Parking Torres Quevedo)\nReference: OFFLINE-123"
+        self.form.records[0] = self.form.target = row
+        result = self.run_command("--reference", "OFFLINE-123")
+        self.assertEqual(result["outcome"], "preview")
+        self.assertEqual((result["building"], result["floor"]), ("NEWTON", "Parking Torres Quevedo"))
+        self.form.trigger.click.assert_not_called()
 
     def test_confirmation_checks_schedule_and_location_text(self):
         dialog_cases = (
@@ -532,6 +570,9 @@ class CancellationCommandTests(unittest.TestCase):
             ("NEWTON, Parking Superficie C", "unknown"),
             ("NEWTON, Parking Superficie C\nBuilding: NEWTON\nFloor: Parking Torres Quevedo", "unknown"),
             ("NEWTON, Parking Torres Quevedo", "cancelled"),
+            ("NEWTON (Parking Superficie C)\nBuilding: NEWTON\nFloor: Parking Torres Quevedo", "unknown"),
+            ("Parking Torres Quevedo (OTHER BUILDING)", "unknown"),
+            ("NEWTON (Parking Torres Quevedo)", "cancelled"),
             ("PTQ-124", "unknown"),
             ("PTQ-124\nSpace: PTQ-123", "unknown"),
             ("PTQ-123\nSpace: PTQ-123", "cancelled"),
@@ -767,14 +808,22 @@ class ParkingCommandTests(unittest.TestCase):
                                    "location_on NEWTON, Parking Torres Quevedo")
         conflicting_tail = card + "\nschedule 07:00–23:00location_on OTHER, Parking Superficie C"
         standalone = card + "\nNEWTON, Parking Torres Quevedo"
+        parenthesized = card + "\nNEWTON (Parking Torres Quevedo)"
+        reverse_pair = card + "\nParking Superficie C (OTHER BUILDING)"
         for record, details in ((card, conflicting), (conflicting, card), (card, conflicting_tail),
-                                (card, standalone), (standalone, card)):
+                                (card, standalone), (standalone, card), (card, parenthesized),
+                                (parenthesized, card), (card, reverse_pair), (reverse_pair, card)):
             with self.subTest(record=record, details=details):
                 self.form.after_submit = [record]
                 self.form.details = details
                 self.assertEqual(self.run_command(*args)["outcome"], "unknown")
-        self.form.after_submit = [card]
-        self.form.details = card
+        refusal = "Bookker reported a booking date or booking window restriction."
+        selection = read_intent(self.form.intent)
+        result = verify_booking([parenthesized], selection, self.form, recovered=False, base_url="about:blank",
+                                observation={"book": refusal})
+        self.assertEqual(result["outcome"], "unknown")
+        self.form.after_submit = [card + "\nNEWTON (Parking Superficie C)"]
+        self.form.details = card + "\nParking Superficie C (NEWTON)"
         self.assertEqual(self.run_command(*args)["outcome"], "confirmed")
         self.assertEqual(self.form.clicks, 1)
 
@@ -791,6 +840,40 @@ class ParkingCommandTests(unittest.TestCase):
         self.form.details = card
         self.assertEqual(self.run_command(*args)["outcome"], "confirmed")
         self.assertEqual(self.form.clicks, 1)
+
+    def test_superficie_cli_checks_title_and_labeled_space_before_final_click(self):
+        page = Mock()
+        page.locator.return_value.get_attribute.return_value = "en"
+        prompt_form = ParkingForm(page)
+        args = self.superficie_args() + ("--confirm",)
+        booking_details = "November 21, 2026\n07:00–23:00\nNEWTON, Parking Superficie C"
+        card = f"PSC-17\n{booking_details}"
+        cases = (("PSC-18", "PSC-17", "unknown"), ("PSC-17", "PSC-18", "unknown"),
+                 ("PSC-17", "PSC-17", "confirmed"))
+        for index, (title, label, expected) in enumerate(cases):
+            with self.subTest(title=title, label=label):
+                self.form.intent = self.form.intent.with_name(f"intent-{index}.json")
+                self.form.after_submit = []
+                self.form.details = card
+                prompt = (f"Please confirm your booking\n{title}\nSpace: {label}\n"
+                          f"{booking_details}\nRepetir\nNunca\nConfirm booking")
+                self.form.after_book = ("Bookker displayed a separate final confirmation step.", prompt)
+                action = Mock()
+
+                def confirm(**kwargs):
+                    self.form.after_submit = [card]
+
+                action.click.side_effect = confirm
+                with (patch.object(prompt_form, "final_prompt", return_value=(action, prompt)),
+                      patch.object(self.form, "verify_final_prompt", prompt_form.verify_final_prompt, create=True)):
+                    result = self.run_command(*args, "--submission-state", str(self.form.intent))
+                self.assertEqual(result["outcome"], expected)
+                if expected == "unknown":
+                    action.click.assert_not_called()
+                    self.assertFalse(self.form.intent.with_suffix(FINAL_ATTEMPT).exists())
+                else:
+                    action.click.assert_called_once()
+                    self.assertTrue(self.form.intent.with_suffix(FINAL_ATTEMPT).exists())
 
     def test_exact_date_stops_at_an_existing_reservation(self):
         self.form.existing = [MATCH.replace("November 23", "November 26")]

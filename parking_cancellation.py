@@ -6,9 +6,9 @@ from dataclasses import asdict, dataclass
 from datetime import date
 
 from parking_booking import (
-    LOCATION_FIELD, LOCATION_SEPARATOR, MADRID, PARKING_TYPE, SIGN_IN, SPACE_CODE, SPACE_FIELD,
+    LOCATION_FIELD, MADRID, PARKING_TYPE, SIGN_IN, SPACE_CODE, SPACE_FIELD,
     BookingProblem, ParkingForm, booking_references, card_locations, dates, displayed_spaces,
-    field_values, intervals, normalized, outcome, shows_location, visible, write_json,
+    field_values, intervals, location_pair_names, normalized, outcome, shift_span, shows_location, visible, write_json,
 )
 
 CANCEL_CHECK = "Check the selected reservation in Bookker Bookings."
@@ -43,11 +43,12 @@ def booking_location(text):
     combined = list(field_values(text, r"Building|Edificio|Location|Ubicación", split_inline=False))
     combined.extend(card_locations(text))
     for label in combined:
-        names = re.split(LOCATION_SEPARATOR, label.strip().rstrip(","))
-        if len(names) == 2 and all(names) and shows_location(text, *names):
-            if PARKING_TYPE.search(names[0]) and not PARKING_TYPE.search(names[1]):
-                names.reverse()
-            return tuple(names)
+        names = location_pair_names(label)
+        if names and shows_location(text, *names):
+            building, floor = names
+            if PARKING_TYPE.search(building) and not PARKING_TYPE.search(floor):
+                return floor, building
+            return building, floor
     return None
 
 
@@ -117,7 +118,13 @@ def reservation_details(record, target, requested_location, form, base_url, day)
         location = location or linked_location
         linked_spaces = displayed_spaces(linked, form.day_first, location or ())
         days |= dates(linked, form.day_first)
-        hours = hours or intervals(linked)
+        linked_hours = intervals(linked)
+        if hours and linked_hours and hours != linked_hours:
+            span = shift_span(hours)
+            if span is None or span != shift_span(linked_hours):
+                raise BookingProblem("The linked booking details showed different hours than the Bookings row.",
+                                     CANCEL_CHECK)
+        hours = hours or linked_hours
 
     spaces = linked_spaces | card_spaces
     if len(spaces) > 1:

@@ -126,6 +126,7 @@ SPACE_FIELD = r"Parking space|Space|Plaza|Resource|Recurso"
 LOCATION_FIELD = r"Building|Edificio|Floor|Planta|Location|Ubicación"
 LOCATION_ICON = re.compile(r"^(?:location_on\s*|place(?:\s+|$))", re.I)
 LOCATION_SEPARATOR = r"\s*[,/|·•]\s*"
+PARENTHESIZED_LOCATION = re.compile(r"([^():]+)\(([^():]+)\)")
 PARKING_TYPE = re.compile(r"\b(?:parking|aparcamiento|estacionamiento|plaza)\b", re.I)
 REFERENCE_FIELD = (r"Reference|Confirmation(?: (?:reference|code|number|ID))?|"
                    r"Booking (?:reference|number|ID)|Reservation (?:reference|number|ID)|"
@@ -134,7 +135,7 @@ REFERENCE_CODE = r"[\w#-]{1,80}"
 SPACE_CODE = r"[\w][\w .#/-]{0,47}"
 BOOKING_DETAIL_FIELD = re.compile(
     rf"(?:{SPACE_FIELD}|{LOCATION_FIELD}|{REFERENCE_FIELD}|{STATUS_FIELD}|Date|Fecha|Time|Schedule|"
-    r"Horario|Type|Resource type|Tipo|Vehicle|Vehículo|Repeat|Repetición)(?:\s*:\s*(.*))?", re.I,
+    r"Horario|Type|Resource type|Tipo|Vehicle|Vehículo|Repeat|Repetir|Repetición)(?:\s*:\s*(.*))?", re.I,
 )
 BOOKING_DETAILS_ACTION = re.compile(
     r"^(?:(?:(?:View|Show|Open) )?(?:(?:booking|reservation) )?"
@@ -145,6 +146,7 @@ BOOKING_CONTROL = re.compile(
     r"Detalles de la reserva|(?:View|Show|Open) map|Ver mapa|"
     r"Booking|Reservation|Reserva|My bookings|Mis reservas|Parking|Aparcamiento|"
     r"Close|Back|Cerrar|Volver|Confirm(?: deletion)?|Confirmar|Yes|Sí|No|Cancel|Cancelar|"
+    r"(?:Please )?confirm your (?:booking|reservation)\.?|"
     r"(?:Delete|Eliminar)(?: (?:this )?(?:booking|reservation|reserva))?|"
     r"Recurring series|Recurring|No repeat|Sin repetición|"
     r"(?:Delete )?(?:Only this |This |All )(?:bookings?|occurrences?|reservations?)(?: only)?|Single occurrence|"
@@ -401,11 +403,19 @@ def shows(text, labels, value):
     return any(normalized(part) == normalized(value) for part in fields(text))
 
 
+def location_pair_names(text):
+    label = text.strip().rstrip(",").rstrip()
+    pair = PARENTHESIZED_LOCATION.fullmatch(label)
+    parts = pair.groups() if pair else re.split(LOCATION_SEPARATOR, label)
+    names = tuple(part.strip() for part in parts)
+    if len(names) == 2 and all(name and ":" not in name for name in names):
+        return names
+    return ()
+
+
 def is_standalone_parking_location(line):
-    names = re.split(LOCATION_SEPARATOR, line.strip().rstrip(","))
     # The bare layout places a parking floor and building on the same line.
-    return (len(names) == 2 and all(name and ":" not in name for name in names)
-            and any(PARKING_TYPE.search(name) for name in names))
+    return any(PARKING_TYPE.search(name) for name in location_pair_names(line))
 
 
 def card_locations(text):
@@ -484,6 +494,7 @@ def displayed_spaces(text, day_first, location=()):
             continue
         if (re.fullmatch(SPACE_CODE, line) and normalized(line) not in location_names
                 and not BOOKING_CONTROL.fullmatch(line) and not BOOKING_DETAILS_ACTION.fullmatch(line)
+                and not FINAL_ACTION.fullmatch(line)
                 and not dates(line, day_first)
                 and not booking_statuses(line) and not shows_all_day(line) and not is_standalone_parking_location(line)
                 and not (location and shows_location(line, *location))):
@@ -1075,12 +1086,13 @@ class ParkingForm:
         details = "\n".join(line for line in text.splitlines() if normalized(line) != normalized(selection.space))
         vehicles = {normalized(value) for value in field_values(text, r"Vehicle|Vehículo")}
         repeats = {normalized(value) for value in field_values(text, r"Repeat|Repetir|Repetición")}
+        spaces = displayed_spaces(text, self.day_first, (selection.building, selection.floor))
         if (
             text != expected_text or not action.is_enabled(timeout=1000)
             or dates(details, self.day_first) != {day}
             or not shows_interval(details, selection)
             or not shows_location(text, selection.building, selection.floor)
-            or not shows(text, r"Parking space|Space|Plaza|Resource|Recurso", selection.space)
+            or spaces.keys() != {normalized(selection.space)}
             or (vehicles and vehicles != {normalized(vehicle)})
             or repeats - {"", "none", "no repeat", "never", "no", "nunca", "sin repetición"}
         ):
@@ -1466,8 +1478,6 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
         return INTERVAL.search(record) or shows_all_day(record) or list(field_values(record, r"Time|Schedule|Horario"))
 
     def matches(record):
-        if dates(record, form.day_first) != {day} or not matching_space(record):
-            return False
         if complete(record):
             return True
         if base_url is None:
@@ -1475,9 +1485,10 @@ def verify_booking(records, selection, form, recovered, *, base_url=None, observ
         has_location = list(field_values(record, LOCATION_FIELD)) or card_locations(record)
         return not has_location or matching_location(record)
 
-    matches = [record for record in records if matches(record)]
+    candidates = [record for record in records if dates(record, form.day_first) == {day} and matching_space(record)]
+    matches = [record for record in candidates if matches(record)]
     if len(matches) != 1:
-        if not matches and refusal and superficie:
+        if not candidates and refusal and superficie:
             return outcome("refused", refusal, RECONCILE)
         reason = ("Reloaded Bookings showed multiple matching reservations." if matches
                   else "Reloaded Bookings did not show a verifiable matching reservation.")
